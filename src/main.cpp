@@ -10,6 +10,7 @@
 #include <driver/uart.h>
 #include <SD.h>
 #include <FS.h>
+#include <WireGuard-ESP32.h>
 
 // --- WiFi / SSH Config (loaded from SD /CONFIG) ---
 
@@ -19,6 +20,17 @@ static char config_ssh_host[64]   = "";
 static int  config_ssh_port       = 22;
 static char config_ssh_user[64]   = "";
 static char config_ssh_pass[64]   = "";
+
+// --- VPN Config (loaded from SD /CONFIG) ---
+static bool   config_vpn_enabled = false;
+static char   config_vpn_privkey[64] = "";
+static char   config_vpn_pubkey[64]  = "";
+static char   config_vpn_psk[64]     = "";
+static char   config_vpn_ip[32]      = "";
+static char   config_vpn_endpoint[64] = "";
+static int    config_vpn_port        = 51820;
+static WireGuard wg;
+static bool   vpn_connected = false;
 
 // --- SD Card State ---
 static bool sd_mounted = false;
@@ -570,23 +582,32 @@ void sdLoadConfig() {
 
     // CONFIG format: one value per line, # comments, blank lines skipped
     // Line order: wifi_ssid, wifi_pass, ssh_host, ssh_port, ssh_user, ssh_pass
-    char* fields[] = { config_wifi_ssid, config_wifi_pass, config_ssh_host, NULL, config_ssh_user, config_ssh_pass };
-    int sizes[]    = { 64, 64, 64, 0, 64, 64 };
+    //             vpn_enabled (ENABLE), vpn_privkey, vpn_pubkey, vpn_psk, vpn_ip, vpn_endpoint, vpn_port
+    char* fields[] = {
+        config_wifi_ssid, config_wifi_pass, config_ssh_host, NULL, config_ssh_user, config_ssh_pass,
+        NULL, config_vpn_privkey, config_vpn_pubkey, config_vpn_psk, config_vpn_ip, config_vpn_endpoint, NULL
+    };
+    int sizes[] = { 64, 64, 64, 0, 64, 64, 0, 64, 64, 64, 32, 64, 0 };
     int field = 0;
 
-    while (f.available() && field < 6) {
+    while (f.available() && field < 13) {
         String line = f.readStringUntil('\n');
         line.trim();
         if (line.length() == 0 || line[0] == '#') continue;
         if (field == 3) {
             config_ssh_port = line.toInt();
+        } else if (field == 6) {
+            config_vpn_enabled = line.equalsIgnoreCase("ENABLE");
+        } else if (field == 12) {
+            config_vpn_port = line.toInt();
         } else {
             strncpy(fields[field], line.c_str(), sizes[field] - 1);
         }
         field++;
     }
     f.close();
-    Serial.printf("SD: config loaded (SSID=%s, host=%s)\n", config_wifi_ssid, config_ssh_host);
+    Serial.printf("SD: config loaded (SSID=%s, host=%s, VPN=%s)\n",
+                  config_wifi_ssid, config_ssh_host, config_vpn_enabled ? "on" : "off");
 }
 
 // --- File I/O Helpers ---
@@ -930,6 +951,28 @@ bool hasNetwork() {
     return (wifi_state == WIFI_CONNECTED) || (modem_state == MODEM_PPP_UP);
 }
 
+bool vpnConnect() {
+    if (vpn_connected || !config_vpn_enabled) return true;
+    Serial.println("VPN: syncing time via NTP...");
+    configTime(0, 0, "pool.ntp.org", "time.google.com");
+    struct tm tm;
+    int tries = 0;
+    while (!getLocalTime(&tm) && tries++ < 10) delay(500);
+    if (tries >= 10) {
+        Serial.println("VPN: NTP sync failed");
+        return false;
+    }
+    Serial.printf("VPN: connecting to %s:%d...\n", config_vpn_endpoint, config_vpn_port);
+    IPAddress local_ip;
+    local_ip.fromString(config_vpn_ip);
+    const char* psk = config_vpn_psk[0] ? config_vpn_psk : NULL;
+    wg.begin(local_ip, config_vpn_privkey, config_vpn_endpoint,
+             config_vpn_pubkey, config_vpn_port, psk);
+    vpn_connected = true;
+    Serial.println("VPN: connected");
+    return true;
+}
+
 bool sshConnect() {
     if (!hasNetwork()) {
         Serial.println("SSH: no network (WiFi or 4G)");
@@ -938,6 +981,14 @@ bool sshConnect() {
     if (ssh_connected) {
         Serial.println("SSH: already connected");
         return false;
+    }
+
+    // Connect VPN if enabled
+    if (config_vpn_enabled && !vpn_connected) {
+        if (!vpnConnect()) {
+            Serial.println("SSH: VPN connect failed, aborting");
+            return false;
+        }
     }
 
     // Clean up any previous session
@@ -1253,9 +1304,9 @@ void drawTerminalStatusBar() {
     char status[60];
     // Build compact connection string
     if (ssh_connecting) {
-        snprintf(status, sizeof(status), "SSH...");
+        snprintf(status, sizeof(status), vpn_connected ? "VPN SSH..." : "SSH...");
     } else if (ssh_connected) {
-        const char* net = (modem_state == MODEM_PPP_UP) ? "4G" : "WiFi";
+        const char* net = vpn_connected ? "VPN" : (modem_state == MODEM_PPP_UP) ? "4G" : "WiFi";
         snprintf(status, sizeof(status), "%s %s@%s", net, config_ssh_user, config_ssh_host);
     } else if (modem_state == MODEM_PPP_UP) {
         snprintf(status, sizeof(status), "4G OK");
@@ -1808,6 +1859,91 @@ void uploadTask(void* param) {
     vTaskDelete(NULL);
 }
 
+// --- SCP Download ---
+
+static volatile bool download_running = false;
+static volatile int download_done_count = 0;
+static volatile int download_total_count = 0;
+
+bool scpPullFile(ssh_scp scp, const char* remote_name, size_t size) {
+    char buf[MAX_TEXT_LEN];
+    size_t remaining = size;
+    size_t offset = 0;
+    while (remaining > 0) {
+        size_t chunk = remaining > sizeof(buf) ? sizeof(buf) : remaining;
+        int n = ssh_scp_read(scp, buf + offset, chunk);
+        if (n < 0) return false;
+        offset += n;
+        remaining -= n;
+    }
+
+    String path = "/" + String(remote_name);
+    sdAcquire();
+    File f = SD.open(path.c_str(), FILE_WRITE);
+    if (!f) { sdRelease(); return false; }
+    f.write((uint8_t*)buf, offset);
+    f.close();
+    sdRelease();
+    return true;
+}
+
+void downloadTask(void* param) {
+    download_running = true;
+    download_done_count = 0;
+    download_total_count = 0;
+
+    ssh_scp scp = ssh_scp_new(ssh_sess, SSH_SCP_READ | SSH_SCP_RECURSIVE, "tdeck");
+    if (!scp) {
+        cmdSetResult("SCP: init failed");
+        render_requested = true;
+        download_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+    if (ssh_scp_init(scp) != SSH_OK) {
+        cmdSetResult("SCP: %s", ssh_get_error(ssh_sess));
+        ssh_scp_free(scp);
+        render_requested = true;
+        download_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    cmdSetResult("Downloading...");
+    render_requested = true;
+
+    int r;
+    while ((r = ssh_scp_pull_request(scp)) != SSH_SCP_REQUEST_EOF) {
+        if (r == SSH_SCP_REQUEST_NEWDIR) {
+            ssh_scp_accept_request(scp);
+            continue;
+        }
+        if (r == SSH_SCP_REQUEST_ENDDIR) {
+            continue;
+        }
+        if (r == SSH_SCP_REQUEST_NEWFILE) {
+            size_t size = ssh_scp_request_get_size(scp);
+            const char* name = ssh_scp_request_get_filename(scp);
+            download_total_count++;
+            ssh_scp_accept_request(scp);
+            if (scpPullFile(scp, name, size)) {
+                download_done_count++;
+                render_requested = true;
+            }
+            continue;
+        }
+        if (r == SSH_ERROR) break;
+    }
+
+    ssh_scp_close(scp);
+    ssh_scp_free(scp);
+
+    cmdSetResult("Download done: %d files", download_done_count);
+    render_requested = true;
+    download_running = false;
+    vTaskDelete(NULL);
+}
+
 // --- Command Processor ---
 
 void executeCommand(const char* cmd) {
@@ -1908,6 +2044,15 @@ void executeCommand(const char* cmd) {
             xTaskCreatePinnedToCore(uploadTask, "upload", 16384, NULL, 1, NULL, 1);
             cmdSetResult("Starting upload...");
         }
+    } else if (strcmp(word, "d") == 0 || strcmp(word, "download") == 0) {
+        if (!ssh_connected) {
+            cmdSetResult("SSH not connected");
+        } else if (download_running) {
+            cmdSetResult("Download in progress...");
+        } else {
+            xTaskCreatePinnedToCore(downloadTask, "download", 16384, NULL, 1, NULL, 1);
+            cmdSetResult("Starting download...");
+        }
     }
     // --- Other commands ---
     else if (strcmp(word, "p") == 0 || strcmp(word, "paste") == 0) {
@@ -1923,7 +2068,7 @@ void executeCommand(const char* cmd) {
             }
             cmdSetResult("Pasted %d chars", text_len);
         }
-    } else if (strcmp(word, "d") == 0 || strcmp(word, "dc") == 0) {
+    } else if (strcmp(word, "dc") == 0) {
         sshDisconnect();
         cmdSetResult("Disconnected");
     } else if (strcmp(word, "f") == 0 || strcmp(word, "refresh") == 0) {
@@ -1954,8 +2099,8 @@ void executeCommand(const char* cmd) {
     } else if (strcmp(word, "?") == 0 || strcmp(word, "h") == 0 || strcmp(word, "help") == 0) {
         cmdClearResult();
         cmdAddLine("(l)ist (e)dit (w)rite (n)ew");
-        cmdAddLine("(r)m (u)pload (p)aste (d)c");
-        cmdAddLine("(s)tatus re(f)resh (4)g (h)elp");
+        cmdAddLine("(r)m (u)pload (d)ownload");
+        cmdAddLine("(p)aste dc re(f)resh (4)g (h)elp");
     } else {
         cmdSetResult("Unknown: %s (?=help)", word);
     }
@@ -2067,6 +2212,10 @@ void renderCommandPrompt() {
             char ul[40];
             snprintf(ul, sizeof(ul), "Upload: %d/%d", (int)upload_done_count, (int)upload_total_count);
             display.print(ul);
+        } else if (download_running) {
+            char dl[40];
+            snprintf(dl, sizeof(dl), "Download: %d/%d", (int)download_done_count, (int)download_total_count);
+            display.print(dl);
         } else {
             display.print("[CMD] ? help | MIC exit");
         }
