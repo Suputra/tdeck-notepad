@@ -8,16 +8,22 @@
 #include <esp_task_wdt.h>
 #include <esp_netif.h>
 #include <driver/uart.h>
+#include <SD.h>
+#include <FS.h>
 
-// --- WiFi / SSH Credentials ---
+// --- WiFi / SSH Config (loaded from SD /CONFIG) ---
 
-#define WIFI_SSID     "REDACTED_SSID"
-#define WIFI_PASSWORD "REDACTED_WIFI_PASS"
+static char config_wifi_ssid[64]  = "";
+static char config_wifi_pass[64]  = "";
+static char config_ssh_host[64]   = "";
+static int  config_ssh_port       = 22;
+static char config_ssh_user[64]   = "";
+static char config_ssh_pass[64]   = "";
 
-#define SSH_HOST      "REDACTED_HOST"
-#define SSH_PORT      22
-#define SSH_USER      "saahas"
-#define SSH_PASS      "REDACTED_SSH_PASS"
+// --- SD Card State ---
+static bool sd_mounted = false;
+static volatile bool sd_busy = false;      // display task yields when true
+static volatile bool display_idle = true;  // false while display is doing SPI
 
 // --- Pin Definitions ---
 
@@ -105,14 +111,6 @@ static const char keymap_sym[KEYPAD_ROWS][KEYPAD_COLS] = {
 enum AppMode { MODE_NOTEPAD, MODE_TERMINAL, MODE_COMMAND };
 static volatile AppMode app_mode = MODE_NOTEPAD;
 
-// --- Command Processor State ---
-#define CMD_BUF_LEN 64
-static char cmd_buf[CMD_BUF_LEN + 1];
-static int  cmd_len = 0;
-static char cmd_result[128];  // Result message to display
-static bool cmd_result_valid = false;
-static AppMode cmd_return_mode = MODE_NOTEPAD;  // Mode to return to after command
-
 // --- Editor State (shared between cores, protected by mutex) ---
 
 #define MAX_TEXT_LEN    4096
@@ -125,6 +123,22 @@ static AppMode cmd_return_mode = MODE_NOTEPAD;  // Mode to return to after comma
 #define STATUS_H        10
 #define COLS_PER_LINE   ((SCREEN_W - MARGIN_X * 2) / CHAR_W)
 #define ROWS_PER_SCREEN ((SCREEN_H - MARGIN_Y - STATUS_H) / CHAR_H)
+
+// --- Command Processor State ---
+#define CMD_BUF_LEN 64
+static char cmd_buf[CMD_BUF_LEN + 1];
+static int  cmd_len = 0;
+static AppMode cmd_return_mode = MODE_NOTEPAD;  // Mode to return to after command
+
+// Multi-line command result (half screen)
+#define CMD_RESULT_LINES 13
+static char cmd_result[CMD_RESULT_LINES][COLS_PER_LINE + 1];
+static int  cmd_result_count = 0;
+static bool cmd_result_valid = false;
+
+// --- File State ---
+static String current_file = "";
+static bool file_modified = false;
 
 static SemaphoreHandle_t state_mutex;
 static volatile bool render_requested = false;
@@ -531,13 +545,156 @@ void terminalAppendOutput(const char* data, int len) {
     }
 }
 
+// --- SD Card ---
+
+void sdAcquire() {
+    sd_busy = true;
+    while (!display_idle) vTaskDelay(1);
+}
+void sdRelease() { sd_busy = false; }
+
+void sdInit() {
+    if (SD.begin(BOARD_SD_CS, SPI, 4000000)) {
+        sd_mounted = true;
+        Serial.printf("SD: mounted, size=%lluMB\n", SD.cardSize() / (1024 * 1024));
+    } else {
+        sd_mounted = false;
+        Serial.println("SD: mount failed");
+    }
+}
+
+void sdLoadConfig() {
+    if (!sd_mounted) return;
+    File f = SD.open("/CONFIG", FILE_READ);
+    if (!f) { Serial.println("SD: no /CONFIG"); return; }
+
+    // CONFIG format: one value per line, # comments, blank lines skipped
+    // Line order: wifi_ssid, wifi_pass, ssh_host, ssh_port, ssh_user, ssh_pass
+    char* fields[] = { config_wifi_ssid, config_wifi_pass, config_ssh_host, NULL, config_ssh_user, config_ssh_pass };
+    int sizes[]    = { 64, 64, 64, 0, 64, 64 };
+    int field = 0;
+
+    while (f.available() && field < 6) {
+        String line = f.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0 || line[0] == '#') continue;
+        if (field == 3) {
+            config_ssh_port = line.toInt();
+        } else {
+            strncpy(fields[field], line.c_str(), sizes[field] - 1);
+        }
+        field++;
+    }
+    f.close();
+    Serial.printf("SD: config loaded (SSID=%s, host=%s)\n", config_wifi_ssid, config_ssh_host);
+}
+
+// --- File I/O Helpers ---
+
+struct FileEntry {
+    char name[64];
+    bool is_dir;
+    size_t size;
+};
+
+#define MAX_FILE_LIST 50
+static FileEntry file_list[MAX_FILE_LIST];
+static int file_list_count = 0;
+
+void cmdClearResult() {
+    cmd_result_count = 0;
+    cmd_result_valid = false;
+    for (int i = 0; i < CMD_RESULT_LINES; i++) cmd_result[i][0] = '\0';
+}
+
+void cmdAddLine(const char* fmt, ...) {
+    if (cmd_result_count >= CMD_RESULT_LINES) return;
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(cmd_result[cmd_result_count], COLS_PER_LINE + 1, fmt, args);
+    va_end(args);
+    cmd_result_count++;
+    cmd_result_valid = true;
+}
+
+void cmdSetResult(const char* fmt, ...) {
+    cmdClearResult();
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(cmd_result[0], COLS_PER_LINE + 1, fmt, args);
+    va_end(args);
+    cmd_result_count = 1;
+    cmd_result_valid = true;
+}
+
+int listDirectory(const char* path) {
+    file_list_count = 0;
+    sdAcquire();
+    File dir = SD.open(path);
+    if (!dir || !dir.isDirectory()) {
+        sdRelease();
+        return -1;
+    }
+    File entry = dir.openNextFile();
+    while (entry && file_list_count < MAX_FILE_LIST) {
+        const char* name = entry.name();
+        // Get just the filename (skip path prefix)
+        const char* slash = strrchr(name, '/');
+        const char* display_name = slash ? slash + 1 : name;
+        if (display_name[0] != '.') {
+            strncpy(file_list[file_list_count].name, display_name, sizeof(file_list[0].name) - 1);
+            file_list[file_list_count].name[sizeof(file_list[0].name) - 1] = '\0';
+            file_list[file_list_count].is_dir = entry.isDirectory();
+            file_list[file_list_count].size = entry.size();
+            file_list_count++;
+        }
+        entry = dir.openNextFile();
+    }
+    dir.close();
+    sdRelease();
+    return file_list_count;
+}
+
+bool saveToFile(const char* path) {
+    sdAcquire();
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) { sdRelease(); return false; }
+    f.write((const uint8_t*)text_buf, text_len);
+    f.close();
+    sdRelease();
+    file_modified = false;
+    return true;
+}
+
+bool loadFromFile(const char* path) {
+    sdAcquire();
+    File f = SD.open(path, FILE_READ);
+    if (!f) { sdRelease(); return false; }
+    size_t sz = f.size();
+    if (sz > MAX_TEXT_LEN) sz = MAX_TEXT_LEN;
+    text_len = f.read((uint8_t*)text_buf, sz);
+    text_buf[text_len] = '\0';
+    cursor_pos = text_len;
+    scroll_line = 0;
+    f.close();
+    sdRelease();
+    file_modified = false;
+    return true;
+}
+
+void autoSaveDirty() {
+    if (!file_modified || text_len == 0) return;
+    if (current_file.length() == 0) current_file = "/UNSAVED";
+    saveToFile(current_file.c_str());
+}
+
 // --- WiFi ---
 
 void wifiConnect() {
     if (wifi_state == WIFI_CONNECTING || wifi_state == WIFI_CONNECTED) return;
     wifi_state = WIFI_CONNECTING;
     WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    WiFi.begin(config_wifi_ssid, config_wifi_pass);
     Serial.println("WiFi: connecting...");
 }
 
@@ -786,7 +943,7 @@ bool sshConnect() {
     // Clean up any previous session
     sshDisconnect();
 
-    Serial.printf("SSH: connecting to %s:%d...\n", SSH_HOST, SSH_PORT);
+    Serial.printf("SSH: connecting to %s:%d...\n", config_ssh_host, config_ssh_port);
 
     ssh_sess = ssh_new();
     if (!ssh_sess) {
@@ -794,10 +951,10 @@ bool sshConnect() {
         return false;
     }
 
-    ssh_options_set(ssh_sess, SSH_OPTIONS_HOST, SSH_HOST);
-    int port = SSH_PORT;
+    ssh_options_set(ssh_sess, SSH_OPTIONS_HOST, config_ssh_host);
+    int port = config_ssh_port;
     ssh_options_set(ssh_sess, SSH_OPTIONS_PORT, &port);
-    ssh_options_set(ssh_sess, SSH_OPTIONS_USER, SSH_USER);
+    ssh_options_set(ssh_sess, SSH_OPTIONS_USER, config_ssh_user);
 
     if (ssh_connect(ssh_sess) != SSH_OK) {
         Serial.printf("SSH: connect failed: %s\n", ssh_get_error(ssh_sess));
@@ -807,7 +964,7 @@ bool sshConnect() {
         return false;
     }
 
-    if (ssh_userauth_password(ssh_sess, NULL, SSH_PASS) != SSH_AUTH_SUCCESS) {
+    if (ssh_userauth_password(ssh_sess, NULL, config_ssh_pass) != SSH_AUTH_SUCCESS) {
         Serial.printf("SSH: auth failed: %s\n", ssh_get_error(ssh_sess));
         ssh_disconnect(ssh_sess);
         ssh_free(ssh_sess);
@@ -1025,10 +1182,17 @@ void drawStatusBar() {
     if (snap_shift) strcat(mods, "SH ");
     if (snap_sym)   strcat(mods, "SY ");
     if (snap_nav)   strcat(mods, "NV ");
-    snprintf(status, sizeof(status), "L%d C%d %s%s",
+    // Show filename if editing a file
+    const char* fname = "";
+    if (current_file.length() > 0) {
+        const char* s = current_file.c_str();
+        const char* sl = strrchr(s, '/');
+        fname = sl ? sl + 1 : s;
+    }
+    snprintf(status, sizeof(status), "%s%s L%d C%d %s",
+             fname, file_modified ? "*" : "",
              info.cursor_line + 1, info.cursor_col + 1,
-             mods,
-             battery_pct >= 0 ? "" : "");
+             mods);
     // Append battery on right side if known
     display.print(status);
     if (battery_pct >= 0) {
@@ -1092,7 +1256,7 @@ void drawTerminalStatusBar() {
         snprintf(status, sizeof(status), "SSH...");
     } else if (ssh_connected) {
         const char* net = (modem_state == MODEM_PPP_UP) ? "4G" : "WiFi";
-        snprintf(status, sizeof(status), "%s %s@%s", net, SSH_USER, SSH_HOST);
+        snprintf(status, sizeof(status), "%s %s@%s", net, config_ssh_user, config_ssh_host);
     } else if (modem_state == MODEM_PPP_UP) {
         snprintf(status, sizeof(status), "4G OK");
     } else if (modem_state >= MODEM_POWERING_ON && modem_state <= MODEM_REGISTERED) {
@@ -1216,26 +1380,31 @@ void displayTask(void* param) {
     xSemaphoreTake(state_mutex, portMAX_DELAY);
     snapshotState();
     xSemaphoreGive(state_mutex);
+    display_idle = false;
     refreshFullClean();
+    display_idle = true;
     prev_layout = computeLayoutFrom(snap_buf, snap_len, snap_cursor);
 
     AppMode last_mode = MODE_NOTEPAD;
     unsigned long term_last_render = 0;
 
     for (;;) {
+        // Yield SPI bus to SD card operations
+        if (sd_busy) { vTaskDelay(1); continue; }
+
         AppMode cur_mode = app_mode;
 
         // Mode switch — full redraw
         if (cur_mode != last_mode) {
             last_mode = cur_mode;
             partial_count = 0;
+            display_idle = false;
             if (cur_mode == MODE_TERMINAL) {
                 xSemaphoreTake(state_mutex, portMAX_DELAY);
                 snapshotTerminalState();
                 xSemaphoreGive(state_mutex);
                 renderTerminalFullClean();
             } else if (cur_mode == MODE_COMMAND) {
-                // Draw command prompt overlay
                 renderCommandPrompt();
             } else {
                 xSemaphoreTake(state_mutex, portMAX_DELAY);
@@ -1244,6 +1413,7 @@ void displayTask(void* param) {
                 refreshFullClean();
                 prev_layout = computeLayoutFrom(snap_buf, snap_len, snap_cursor);
             }
+            display_idle = true;
             render_requested = false;
             term_render_requested = false;
             continue;
@@ -1252,7 +1422,6 @@ void displayTask(void* param) {
         // --- Terminal mode ---
         if (cur_mode == MODE_TERMINAL) {
             if (term_render_requested) {
-                // Debounce: wait 200ms to batch fast output (reduces e-ink ghosting)
                 unsigned long now = millis();
                 if (now - term_last_render < 200) {
                     vTaskDelay(pdMS_TO_TICKS(10));
@@ -1265,11 +1434,13 @@ void displayTask(void* param) {
                 snapshotTerminalState();
                 xSemaphoreGive(state_mutex);
 
+                display_idle = false;
                 if (partial_count >= 20) {
                     renderTerminalFullClean();
                 } else {
                     renderTerminal();
                 }
+                display_idle = true;
             }
             vTaskDelay(1);
             continue;
@@ -1279,7 +1450,9 @@ void displayTask(void* param) {
         if (cur_mode == MODE_COMMAND) {
             if (render_requested) {
                 render_requested = false;
+                display_idle = false;
                 renderCommandPrompt();
+                display_idle = true;
             }
             vTaskDelay(1);
             continue;
@@ -1308,8 +1481,10 @@ void displayTask(void* param) {
         scroll_line = snap_scroll;
         xSemaphoreGive(state_mutex);
 
+        display_idle = false;
         if (partial_count >= 20) {
             refreshFullClean();
+            display_idle = true;
             prev_layout = cur;
             continue;
         }
@@ -1317,6 +1492,7 @@ void displayTask(void* param) {
         int line_delta = abs(cur.cursor_line - prev_layout.cursor_line);
         if (line_delta > ROWS_PER_SCREEN) {
             refreshAllPartial();
+            display_idle = true;
             prev_layout = cur;
             continue;
         }
@@ -1334,6 +1510,7 @@ void displayTask(void* param) {
             if (min_l < 0) min_l = 0;
             refreshLines(min_l, max_l);
         }
+        display_idle = true;
 
         prev_layout = cur;
     }
@@ -1397,12 +1574,23 @@ bool handleNotepadKeyPress(int event_code) {
     // Modifier keys
     if (IS_LSHIFT(row, col_rev)) { shift_held = !shift_held; return false; }
     if (IS_RSHIFT(row, col_rev)) { nav_mode = !nav_mode; return true; }
-    if (IS_SYM(row, col_rev))    { sym_mode = !sym_mode; return true; }
+    if (IS_SYM(row, col_rev))    { sym_mode = true; return true; }
     if (IS_ALT(row, col_rev))    { alt_mode = !alt_mode; return true; }
     if (IS_MIC(row, col_rev))    {
+        if (sym_mode) {
+            sym_mode = false;
+            if (text_len < MAX_TEXT_LEN) {
+                memmove(&text_buf[cursor_pos + 1], &text_buf[cursor_pos], text_len - cursor_pos);
+                text_buf[cursor_pos] = '0';
+                text_len++; cursor_pos++;
+                text_buf[text_len] = '\0';
+                file_modified = true;
+                return true;
+            }
+            return false;
+        }
         unsigned long now = millis();
         if (now - mic_last_press < MIC_DOUBLE_TAP_MS) {
-            // Double-tap: switch to terminal, auto-connect if needed
             mic_last_press = 0;
             app_mode = MODE_TERMINAL;
             if (!ssh_connected && !ssh_connecting) {
@@ -1413,7 +1601,7 @@ bool handleNotepadKeyPress(int event_code) {
             return false;
         }
         mic_last_press = now;
-        return false;  // Wait for potential double-tap
+        return false;
     }
     if (IS_DEAD(row, col_rev))   { return false; }
 
@@ -1430,16 +1618,16 @@ bool handleNotepadKeyPress(int event_code) {
                 text_len--;
                 cursor_pos--;
                 text_buf[text_len] = '\0';
+                file_modified = true;
             } else return false;
         }
-        // Alt+F: Force full e-ink refresh (works in nav mode too)
         else if (alt_mode && base == 'f') { alt_mode = false; partial_count = 100; render_requested = true; return false; }
         else return false;
         return true;
     }
 
     char c;
-    if (sym_mode)        c = keymap_sym[row][col_rev];
+    if (sym_mode)        { c = keymap_sym[row][col_rev]; sym_mode = false; }
     else if (shift_held) c = keymap_upper[row][col_rev];
     else                 c = keymap_lower[row][col_rev];
 
@@ -1451,6 +1639,7 @@ bool handleNotepadKeyPress(int event_code) {
             text_len--;
             cursor_pos--;
             text_buf[text_len] = '\0';
+            file_modified = true;
             return true;
         }
         return false;
@@ -1463,6 +1652,7 @@ bool handleNotepadKeyPress(int event_code) {
             text_len++;
             cursor_pos++;
             text_buf[text_len] = '\0';
+            file_modified = true;
             if (shift_held) shift_held = false;
             return true;
         }
@@ -1482,31 +1672,30 @@ bool handleTerminalKeyPress(int event_code) {
 
     if (row < 0 || row >= KEYPAD_ROWS || col_rev < 0 || col_rev >= KEYPAD_COLS) return false;
 
-    // Modifier keys
     if (IS_LSHIFT(row, col_rev)) { shift_held = !shift_held; return false; }
     if (IS_RSHIFT(row, col_rev)) { nav_mode = !nav_mode; return true; }
-    if (IS_SYM(row, col_rev))    { sym_mode = !sym_mode; return true; }
+    if (IS_SYM(row, col_rev))    { sym_mode = true; return true; }
     if (IS_ALT(row, col_rev))    { alt_mode = !alt_mode; return true; }
     if (IS_MIC(row, col_rev))    {
+        if (sym_mode) { sym_mode = false; sshSendKey('0'); return false; }
         unsigned long now = millis();
         if (now - mic_last_press < MIC_DOUBLE_TAP_MS) {
-            // Double-tap: switch to notepad
             mic_last_press = 0;
             app_mode = MODE_NOTEPAD;
             return false;
         }
         mic_last_press = now;
-        return false;  // Wait for potential double-tap
+        return false;
     }
     if (IS_DEAD(row, col_rev))   { return false; }
 
     // Nav mode: WASD sends arrow escape sequences
     if (nav_mode) {
         char base = keymap_lower[row][col_rev];
-        if (base == 'w') { sshSendString("\x1b[A", 3); return false; }  // Up
-        if (base == 's') { sshSendString("\x1b[B", 3); return false; }  // Down
-        if (base == 'd') { sshSendString("\x1b[C", 3); return false; }  // Right
-        if (base == 'a') { sshSendString("\x1b[D", 3); return false; }  // Left
+        if (base == 'w') { sshSendString("\x1b[A", 3); return false; }
+        if (base == 's') { sshSendString("\x1b[B", 3); return false; }
+        if (base == 'd') { sshSendString("\x1b[C", 3); return false; }
+        if (base == 'a') { sshSendString("\x1b[D", 3); return false; }
         if (base == '\b') { sshSendKey(0x7F); return false; }
         return false;
     }
@@ -1514,13 +1703,9 @@ bool handleTerminalKeyPress(int event_code) {
     // Alt = Ctrl modifier
     if (alt_mode) {
         char base = keymap_lower[row][col_rev];
-        // Alt+Space = Escape
         if (base == ' ') { sshSendKey(0x1B); alt_mode = false; return true; }
-        // Alt+Enter = Tab
         if (base == '\n') { sshSendKey('\t'); alt_mode = false; return true; }
-        // Alt+Backspace = DEL
         if (base == '\b') { sshSendKey(0x7F); alt_mode = false; return false; }
-        // Alt+letter = Ctrl+letter (a=0x01 .. z=0x1A)
         if (base >= 'a' && base <= 'z') {
             sshSendKey(base - 'a' + 1);
             alt_mode = false;
@@ -1530,21 +1715,14 @@ bool handleTerminalKeyPress(int event_code) {
     }
 
     char c;
-    if (sym_mode)        c = keymap_sym[row][col_rev];
+    if (sym_mode)        { c = keymap_sym[row][col_rev]; sym_mode = false; }
     else if (shift_held) c = keymap_upper[row][col_rev];
     else                 c = keymap_lower[row][col_rev];
 
     if (c == 0) return false;
 
-    if (c == '\b') {
-        sshSendKey(0x7F);  // Send DEL
-        return false;
-    }
-
-    if (c == '\n') {
-        sshSendKey('\r');
-        return false;
-    }
+    if (c == '\b') { sshSendKey(0x7F); return false; }
+    if (c == '\n') { sshSendKey('\r'); return false; }
 
     if (c >= ' ' && c <= '~') {
         sshSendKey(c);
@@ -1557,38 +1735,211 @@ bool handleTerminalKeyPress(int event_code) {
 
 // --- Command Processor ---
 
+// --- SCP Upload ---
+
+static volatile bool upload_running = false;
+static volatile int upload_done_count = 0;
+static volatile int upload_total_count = 0;
+
+bool scpPushFile(ssh_scp scp, const char* sd_path, const char* remote_name) {
+    sdAcquire();
+    File f = SD.open(sd_path, FILE_READ);
+    if (!f) { sdRelease(); return false; }
+    size_t sz = f.size();
+
+    // Read entire file into memory (files are small, max 4K)
+    char buf[MAX_TEXT_LEN];
+    int n = f.read((uint8_t*)buf, sz);
+    f.close();
+    sdRelease();
+
+    if (n <= 0) return false;
+    if (ssh_scp_push_file(scp, remote_name, n, 0644) != SSH_OK) return false;
+    return ssh_scp_write(scp, buf, n) == SSH_OK;
+}
+
+void uploadTask(void* param) {
+    upload_running = true;
+    upload_done_count = 0;
+
+    // List flat files at root
+    int n = listDirectory("/");
+    upload_total_count = 0;
+    for (int i = 0; i < n; i++) {
+        if (!file_list[i].is_dir) upload_total_count++;
+    }
+    cmdSetResult("Uploading %d files...", upload_total_count);
+    render_requested = true;
+
+    // Create SCP session using existing SSH connection's session
+    ssh_scp scp = ssh_scp_new(ssh_sess, SSH_SCP_WRITE, "tdeck");
+    if (!scp) {
+        cmdSetResult("SCP: init failed");
+        render_requested = true;
+        upload_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+    if (ssh_scp_init(scp) != SSH_OK) {
+        cmdSetResult("SCP: %s", ssh_get_error(ssh_sess));
+        ssh_scp_free(scp);
+        render_requested = true;
+        upload_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Push each file
+    for (int i = 0; i < n; i++) {
+        if (file_list[i].is_dir) continue;
+        String path = "/" + String(file_list[i].name);
+        if (scpPushFile(scp, path.c_str(), file_list[i].name)) {
+            upload_done_count++;
+            render_requested = true;
+        }
+    }
+
+    ssh_scp_close(scp);
+    ssh_scp_free(scp);
+
+    cmdSetResult("Upload done: %d files", upload_done_count);
+    render_requested = true;
+    upload_running = false;
+    vTaskDelete(NULL);
+}
+
+// --- Command Processor ---
+
 void executeCommand(const char* cmd) {
-    // Single-char shortcuts: p=paste, d=disconnect, r=refresh, 4=4g, s=status, ?/h=help, q=quit
-    if (strcmp(cmd, "p") == 0 || strcmp(cmd, "paste") == 0) {
+    // Parse command word and argument
+    char word[CMD_BUF_LEN + 1];
+    char arg[CMD_BUF_LEN + 1];
+    word[0] = '\0';
+    arg[0] = '\0';
+
+    while (*cmd == ' ') cmd++;
+    if (*cmd == '\0') { cmd_result_valid = false; return; }
+
+    int wi = 0;
+    while (*cmd && *cmd != ' ' && wi < CMD_BUF_LEN) word[wi++] = *cmd++;
+    word[wi] = '\0';
+    while (*cmd == ' ') cmd++;
+    strncpy(arg, cmd, CMD_BUF_LEN);
+    arg[CMD_BUF_LEN] = '\0';
+
+    // --- File commands (flat, all files at /) ---
+    if (strcmp(word, "l") == 0 || strcmp(word, "ls") == 0) {
+        int n = listDirectory("/");
+        if (n < 0) {
+            cmdSetResult("Can't read SD");
+        } else if (n == 0) {
+            cmdSetResult("(empty)");
+        } else {
+            cmdClearResult();
+            for (int i = 0; i < n && i < CMD_RESULT_LINES; i++) {
+                if (file_list[i].is_dir) {
+                    cmdAddLine("[%s]", file_list[i].name);
+                } else {
+                    cmdAddLine("%s %dB", file_list[i].name, (int)file_list[i].size);
+                }
+            }
+            if (n > CMD_RESULT_LINES) cmdAddLine("... +%d more", n - CMD_RESULT_LINES);
+        }
+    } else if (strcmp(word, "e") == 0 || strcmp(word, "edit") == 0) {
+        if (arg[0] == '\0') { cmdSetResult("e <file>"); }
+        else {
+            autoSaveDirty();
+            String path = "/" + String(arg);
+            if (loadFromFile(path.c_str())) {
+                current_file = path;
+                cmdSetResult("Loaded %s (%d B)", arg, text_len);
+                app_mode = MODE_NOTEPAD;
+            } else {
+                text_len = 0; cursor_pos = 0; scroll_line = 0;
+                text_buf[0] = '\0';
+                current_file = path;
+                file_modified = false;
+                cmdSetResult("New: %s", arg);
+                app_mode = MODE_NOTEPAD;
+            }
+        }
+    } else if (strcmp(word, "w") == 0 || strcmp(word, "save") == 0) {
+        if (current_file.length() == 0) {
+            if (arg[0] != '\0') {
+                current_file = "/" + String(arg);
+            } else {
+                current_file = "/UNSAVED";
+            }
+        }
+        if (saveToFile(current_file.c_str())) {
+            cmdSetResult("Saved %s (%d B)", current_file.c_str(), text_len);
+        } else {
+            cmdSetResult("Save failed");
+        }
+    } else if (strcmp(word, "n") == 0 || strcmp(word, "new") == 0) {
+        autoSaveDirty();
+        text_len = 0; cursor_pos = 0; scroll_line = 0;
+        text_buf[0] = '\0';
+        current_file = "";
+        file_modified = false;
+        cmdSetResult("New buffer");
+        app_mode = MODE_NOTEPAD;
+    } else if (strcmp(word, "r") == 0 || strcmp(word, "rm") == 0) {
+        if (arg[0] == '\0') { cmdSetResult("r <name>"); }
+        else {
+            String path = "/" + String(arg);
+            sdAcquire();
+            bool ok = SD.remove(path.c_str());
+            sdRelease();
+            cmdSetResult(ok ? "Removed %s" : "Failed: %s", arg);
+        }
+    } else if (strcmp(word, "u") == 0 || strcmp(word, "upload") == 0) {
+        if (!ssh_connected) {
+            cmdSetResult("SSH not connected");
+        } else if (upload_running) {
+            cmdSetResult("Upload in progress...");
+        } else {
+            char mkdir_cmd[64];
+            snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p ~/tdeck\n");
+            ssh_channel_write(ssh_chan, mkdir_cmd, strlen(mkdir_cmd));
+            vTaskDelay(pdMS_TO_TICKS(500));
+            char drain[256];
+            ssh_channel_read_nonblocking(ssh_chan, drain, sizeof(drain), 0);
+            xTaskCreatePinnedToCore(uploadTask, "upload", 16384, NULL, 1, NULL, 1);
+            cmdSetResult("Starting upload...");
+        }
+    }
+    // --- Other commands ---
+    else if (strcmp(word, "p") == 0 || strcmp(word, "paste") == 0) {
         if (!ssh_connected || !ssh_chan) {
-            snprintf(cmd_result, sizeof(cmd_result), "SSH not connected");
+            cmdSetResult("SSH not connected");
         } else if (text_len == 0) {
-            snprintf(cmd_result, sizeof(cmd_result), "Notepad empty");
+            cmdSetResult("Notepad empty");
         } else {
             for (int i = 0; i < text_len; i += 64) {
                 int chunk = (text_len - i > 64) ? 64 : (text_len - i);
                 ssh_channel_write(ssh_chan, &text_buf[i], chunk);
                 vTaskDelay(pdMS_TO_TICKS(10));
             }
-            snprintf(cmd_result, sizeof(cmd_result), "Pasted %d chars", text_len);
+            cmdSetResult("Pasted %d chars", text_len);
         }
-    } else if (strcmp(cmd, "d") == 0 || strcmp(cmd, "dc") == 0) {
+    } else if (strcmp(word, "d") == 0 || strcmp(word, "dc") == 0) {
         sshDisconnect();
-        snprintf(cmd_result, sizeof(cmd_result), "Disconnected");
-    } else if (strcmp(cmd, "r") == 0 || strcmp(cmd, "refresh") == 0) {
+        cmdSetResult("Disconnected");
+    } else if (strcmp(word, "f") == 0 || strcmp(word, "refresh") == 0) {
         partial_count = 100;
-        snprintf(cmd_result, sizeof(cmd_result), "Full refresh queued");
-    } else if (strcmp(cmd, "4") == 0 || strcmp(cmd, "4g") == 0) {
+        cmdSetResult("Full refresh queued");
+    } else if (strcmp(word, "4") == 0 || strcmp(word, "4g") == 0) {
         if (modem_state == MODEM_OFF || modem_state == MODEM_FAILED) {
             modemStartAsync();
-            snprintf(cmd_result, sizeof(cmd_result), "4G starting...");
+            cmdSetResult("4G starting...");
         } else if (modem_state == MODEM_PPP_UP) {
             modemStop();
-            snprintf(cmd_result, sizeof(cmd_result), "4G stopped");
+            cmdSetResult("4G stopped");
         } else {
-            snprintf(cmd_result, sizeof(cmd_result), "4G busy...");
+            cmdSetResult("4G busy...");
         }
-    } else if (strcmp(cmd, "s") == 0 || strcmp(cmd, "status") == 0) {
+    } else if (strcmp(word, "s") == 0 || strcmp(word, "status") == 0) {
         const char* ws = "off";
         if (wifi_state == WIFI_CONNECTED) ws = "ok";
         else if (wifi_state == WIFI_CONNECTING) ws = "...";
@@ -1596,17 +1947,18 @@ void executeCommand(const char* cmd) {
         if (modem_state == MODEM_PPP_UP) ms = "ok";
         else if (modem_state >= MODEM_POWERING_ON && modem_state <= MODEM_REGISTERED) ms = "...";
         else if (modem_state == MODEM_FAILED) ms = "fail";
-        snprintf(cmd_result, sizeof(cmd_result), "WiFi:%s 4G:%s SSH:%s Bat:%d%%",
-                 ws, ms, ssh_connected ? "ok" : "off", battery_pct);
-    } else if (strcmp(cmd, "?") == 0 || strcmp(cmd, "h") == 0 || strcmp(cmd, "help") == 0) {
-        snprintf(cmd_result, sizeof(cmd_result), "(p)aste (d)c (r)efresh (4)g (s)tatus");
-    } else if (strlen(cmd) == 0) {
-        cmd_result_valid = false;
-        return;
+        cmdClearResult();
+        cmdAddLine("WiFi:%s 4G:%s SSH:%s", ws, ms, ssh_connected ? "ok" : "off");
+        cmdAddLine("Bat:%d%% Heap:%dK", battery_pct, ESP.getFreeHeap() / 1024);
+        if (current_file.length() > 0) cmdAddLine("File:%s%s", current_file.c_str(), file_modified ? "*" : "");
+    } else if (strcmp(word, "?") == 0 || strcmp(word, "h") == 0 || strcmp(word, "help") == 0) {
+        cmdClearResult();
+        cmdAddLine("(l)ist (e)dit (w)rite (n)ew");
+        cmdAddLine("(r)m (u)pload (p)aste (d)c");
+        cmdAddLine("(s)tatus re(f)resh (4)g (h)elp");
     } else {
-        snprintf(cmd_result, sizeof(cmd_result), "? (p)aste (d)c (r)ef (4)g (s)tat");
+        cmdSetResult("Unknown: %s (?=help)", word);
     }
-    cmd_result_valid = true;
 }
 
 bool handleCommandKeyPress(int event_code) {
@@ -1619,17 +1971,25 @@ bool handleCommandKeyPress(int event_code) {
     if (row < 0 || row >= KEYPAD_ROWS || col_rev < 0 || col_rev >= KEYPAD_COLS) return false;
 
     if (IS_SHIFT(row, col_rev)) { shift_held = !shift_held; return false; }
-    if (IS_SYM(row, col_rev))   { sym_mode = !sym_mode; return true; }
+    if (IS_SYM(row, col_rev))   { sym_mode = true; return true; }
     if (IS_ALT(row, col_rev))   { return false; }
     if (IS_MIC(row, col_rev))   {
-        // MIC exits command mode back to previous mode
+        if (sym_mode) {
+            sym_mode = false;
+            if (cmd_len < CMD_BUF_LEN) {
+                cmd_buf[cmd_len++] = '0';
+                cmd_buf[cmd_len] = '\0';
+                return true;
+            }
+            return false;
+        }
         app_mode = cmd_return_mode;
         return false;
     }
     if (IS_DEAD(row, col_rev))  { return false; }
 
     char c;
-    if (sym_mode)        c = keymap_sym[row][col_rev];
+    if (sym_mode)        { c = keymap_sym[row][col_rev]; sym_mode = false; }
     else if (shift_held) c = keymap_upper[row][col_rev];
     else                 c = keymap_lower[row][col_rev];
 
@@ -1663,24 +2023,34 @@ bool handleCommandKeyPress(int event_code) {
 
 void renderCommandPrompt() {
     partial_count++;
-    int prompt_y = SCREEN_H - STATUS_H - CHAR_H * 3;  // 3 lines from bottom
-    int region_h = SCREEN_H - prompt_y;
+    // Half screen: top half stays (notepad/terminal content), bottom half is command area
+    int cmd_area_y = SCREEN_H / 2;
+    int region_h = SCREEN_H - cmd_area_y;
 
-    display.setPartialWindow(0, prompt_y, SCREEN_W, region_h);
+    display.setPartialWindow(0, cmd_area_y, SCREEN_W, region_h);
     display.firstPage();
     do {
         display.fillScreen(GxEPD_WHITE);
         display.setTextColor(GxEPD_BLACK);
         display.setFont(NULL);
 
-        // Show result from last command
+        // Separator line
+        display.drawLine(0, cmd_area_y, SCREEN_W, cmd_area_y, GxEPD_BLACK);
+
+        int y = cmd_area_y + 2;
+
+        // Show multi-line result
         if (cmd_result_valid) {
-            display.setCursor(MARGIN_X, prompt_y + 1);
-            display.print(cmd_result);
+            for (int i = 0; i < cmd_result_count; i++) {
+                display.setCursor(MARGIN_X, y);
+                display.print(cmd_result[i]);
+                y += CHAR_H;
+                if (y >= SCREEN_H - STATUS_H - CHAR_H - 2) break;
+            }
         }
 
-        // Draw prompt line
-        int py = prompt_y + CHAR_H + 2;
+        // Draw prompt line at bottom of command area (above status bar)
+        int py = SCREEN_H - STATUS_H - CHAR_H - 2;
         display.setCursor(MARGIN_X, py);
         display.print("> ");
         display.print(cmd_buf);
@@ -1693,7 +2063,13 @@ void renderCommandPrompt() {
         display.fillRect(0, bar_y, SCREEN_W, STATUS_H, GxEPD_BLACK);
         display.setTextColor(GxEPD_WHITE);
         display.setCursor(2, bar_y + 1);
-        display.print("[CMD] ? for help | MIC to exit");
+        if (upload_running) {
+            char ul[40];
+            snprintf(ul, sizeof(ul), "Upload: %d/%d", (int)upload_done_count, (int)upload_total_count);
+            display.print(ul);
+        } else {
+            display.print("[CMD] ? help | MIC exit");
+        }
     } while (display.nextPage());
 }
 
@@ -1746,6 +2122,10 @@ void setup() {
     display.epd2.selectSPI(SPI, SPISettings(20000000, MSBFIRST, SPI_MODE0));
 
     memset(text_buf, 0, sizeof(text_buf));
+
+    // Init SD card and load config (before display task to avoid SPI contention)
+    sdInit();
+    sdLoadConfig();
 
     // Init terminal buffer
     terminalClear();
