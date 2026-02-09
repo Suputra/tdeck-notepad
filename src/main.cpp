@@ -4,7 +4,6 @@
 #include <GxEPD2_BW.h>
 #include <Adafruit_TCA8418.h>
 #include <WiFi.h>
-#include <WiFiMulti.h>
 #include <libssh/libssh.h>
 #include <esp_task_wdt.h>
 #include <esp_netif.h>
@@ -15,7 +14,9 @@
 
 // --- WiFi / SSH Config (loaded from SD /CONFIG) ---
 
-static WiFiMulti wifiMulti;
+#define MAX_WIFI_APS 8
+struct WiFiAP { char ssid[64]; char pass[64]; };
+static WiFiAP config_wifi[MAX_WIFI_APS];
 static int config_wifi_count = 0;
 static char config_ssh_host[64]   = "";
 static int  config_ssh_port       = 22;
@@ -32,6 +33,10 @@ static int    config_vpn_port        = 51820;
 static WireGuard wg;
 static bool   vpn_connected = false;
 static bool vpnConfigured() { return config_vpn_privkey[0] != '\0'; }
+
+// Forward declarations
+void connectMsg(const char* fmt, ...);
+static int partial_count = 0;
 
 // --- SD Card State ---
 static bool sd_mounted = false;
@@ -604,10 +609,11 @@ void sdLoadConfig() {
             if (field % 2 == 0) {
                 strncpy(wifi_ssid, line.c_str(), 63);
                 wifi_ssid[63] = '\0';
-            } else {
-                wifiMulti.addAP(wifi_ssid, line.c_str());
-                config_wifi_count++;
+            } else if (config_wifi_count < MAX_WIFI_APS) {
+                strncpy(config_wifi[config_wifi_count].ssid, wifi_ssid, 63);
+                strncpy(config_wifi[config_wifi_count].pass, line.c_str(), 63);
                 Serial.printf("SD: WiFi AP added: %s\n", wifi_ssid);
+                config_wifi_count++;
             }
             field++;
         } else if (section == SEC_SSH) {
@@ -736,17 +742,29 @@ void autoSaveDirty() {
 
 // --- WiFi ---
 
+// Try connecting to a single AP, returns true if connected within timeout
+bool wifiTryAP(const char* ssid, const char* pass, int timeout_ms) {
+    WiFi.disconnect();
+    vTaskDelay(pdMS_TO_TICKS(50));
+    WiFi.begin(ssid, pass);
+    int elapsed = 0;
+    while (elapsed < timeout_ms) {
+        if (WiFi.status() == WL_CONNECTED) return true;
+        vTaskDelay(pdMS_TO_TICKS(250));
+        elapsed += 250;
+    }
+    return WiFi.status() == WL_CONNECTED;
+}
+
 void wifiConnect() {
     if (wifi_state == WIFI_CONNECTING || wifi_state == WIFI_CONNECTED) return;
-    if (config_wifi_count == 0) { wifi_state = WIFI_FAILED; return; }
     wifi_state = WIFI_CONNECTING;
     WiFi.mode(WIFI_STA);
-    Serial.println("WiFi: scanning for known networks...");
 }
 
 void wifiCheck() {
     if (wifi_state == WIFI_CONNECTING) {
-        if (wifiMulti.run() == WL_CONNECTED) {
+        if (WiFi.status() == WL_CONNECTED) {
             wifi_state = WIFI_CONNECTED;
             Serial.printf("WiFi: connected to %s, IP=%s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
         }
@@ -978,23 +996,23 @@ bool hasNetwork() {
 
 bool vpnConnect() {
     if (vpn_connected) return true;
-    Serial.println("VPN: syncing time via NTP...");
+    connectMsg("VPN: NTP sync...");
     configTime(0, 0, "pool.ntp.org", "time.google.com");
     struct tm tm;
     int tries = 0;
     while (!getLocalTime(&tm) && tries++ < 10) delay(500);
     if (tries >= 10) {
-        Serial.println("VPN: NTP sync failed");
+        connectMsg("VPN: NTP failed");
         return false;
     }
-    Serial.printf("VPN: connecting to %s:%d...\n", config_vpn_endpoint, config_vpn_port);
+    connectMsg("VPN: connecting...");
     IPAddress local_ip;
     local_ip.fromString(config_vpn_ip);
     const char* psk = config_vpn_psk[0] ? config_vpn_psk : NULL;
     wg.begin(local_ip, config_vpn_privkey, config_vpn_endpoint,
              config_vpn_pubkey, config_vpn_port, psk);
     vpn_connected = true;
-    Serial.println("VPN: connected");
+    connectMsg("VPN: %s", config_vpn_ip);
     return true;
 }
 
@@ -1042,20 +1060,24 @@ bool sshConnect() {
     sshDisconnect();
 
     // Try direct SSH first
+    connectMsg("SSH: %s:%d...", config_ssh_host, config_ssh_port);
     if (sshTryConnect()) {
-        Serial.println("SSH: direct connect succeeded");
+        connectMsg("SSH: connected");
     } else if (vpnConfigured() && !vpn_connected) {
         // Direct failed, try VPN
-        Serial.println("SSH: direct failed, trying VPN...");
+        connectMsg("SSH: direct failed");
         if (!vpnConnect()) {
-            Serial.println("SSH: VPN connect failed");
+            connectMsg("SSH: VPN failed");
             return false;
         }
+        connectMsg("SSH: %s (VPN)...", config_ssh_host);
         if (!sshTryConnect()) {
-            Serial.println("SSH: connect via VPN also failed");
+            connectMsg("SSH: failed via VPN");
             return false;
         }
+        connectMsg("SSH: connected (VPN)");
     } else {
+        connectMsg("SSH: failed");
         return false;
     }
 
@@ -1128,10 +1150,85 @@ bool sshConnect() {
 }
 
 static volatile bool ssh_connecting = false;
+#define CONNECT_STATUS_LINES 16
+static char connect_status[CONNECT_STATUS_LINES][COLS_PER_LINE + 1];
+static volatile int connect_status_count = 0;
+
+void connectMsg(const char* fmt, ...) {
+    if (connect_status_count >= CONNECT_STATUS_LINES) return;
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(connect_status[connect_status_count], COLS_PER_LINE + 1, fmt, args);
+    va_end(args);
+    connect_status_count++;
+    term_render_requested = true;
+}
 
 void sshConnectTask(void* param) {
-    sshConnect();
+    connect_status_count = 0;
+
+    // Connect WiFi
+    if (wifi_state != WIFI_CONNECTED) {
+        WiFi.mode(WIFI_STA);
+        bool connected = false;
+
+        // Try each known AP in config order
+        for (int i = 0; i < config_wifi_count && !connected; i++) {
+            connectMsg("WiFi: %s...", config_wifi[i].ssid);
+            if (wifiTryAP(config_wifi[i].ssid, config_wifi[i].pass, 5000)) {
+                connected = true;
+            } else {
+                connectMsg("  failed");
+            }
+        }
+
+        // If all failed, scan and try best match
+        if (!connected) {
+            connectMsg("WiFi: scanning...");
+            int n = WiFi.scanNetworks();
+            if (n > 0) {
+                for (int i = 0; i < n && i < 4; i++) {
+                    connectMsg("  %s (%ddBm)", WiFi.SSID(i).c_str(), WiFi.RSSI(i));
+                }
+                // Try known APs sorted by signal strength
+                for (int rssi_thresh = 0; rssi_thresh > -100 && !connected; rssi_thresh -= 10) {
+                    for (int i = 0; i < n && !connected; i++) {
+                        if (WiFi.RSSI(i) < rssi_thresh - 10 || WiFi.RSSI(i) >= rssi_thresh) continue;
+                        for (int j = 0; j < config_wifi_count; j++) {
+                            if (WiFi.SSID(i) == config_wifi[j].ssid) {
+                                connectMsg("WiFi: %s...", config_wifi[j].ssid);
+                                WiFi.scanDelete();
+                                if (wifiTryAP(config_wifi[j].ssid, config_wifi[j].pass, 5000)) {
+                                    connected = true;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!connected) WiFi.scanDelete();
+            }
+        }
+
+        if (connected) {
+            wifi_state = WIFI_CONNECTED;
+            connectMsg("WiFi: %s (%s)", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+        } else {
+            connectMsg("WiFi: all failed");
+            ssh_connecting = false;
+            vTaskDelete(NULL);
+            return;
+        }
+    } else {
+        connectMsg("WiFi: %s", WiFi.SSID().c_str());
+    }
+
+    bool ok = sshConnect();
     ssh_connecting = false;
+    if (ok) {
+        connect_status_count = 0;
+        partial_count = 100;  // force full clean redraw
+    }
     term_render_requested = true;
     vTaskDelete(NULL);
 }
@@ -1186,8 +1283,6 @@ void sshReceiveTask(void* param) {
 }
 
 // --- Display Rendering (runs on core 0 only, uses snap_ vars) ---
-
-static int partial_count = 0;
 
 void drawLinesRange(int first_line, int last_line) {
     int text_line = 0, col = 0;
@@ -1367,6 +1462,24 @@ void drawTerminalStatusBar() {
     }
 }
 
+void renderConnectScreen() {
+    partial_count++;
+    display.setPartialWindow(0, 0, SCREEN_W, SCREEN_H);
+    display.firstPage();
+    do {
+        display.fillScreen(GxEPD_WHITE);
+        display.setTextColor(GxEPD_BLACK);
+        display.setFont(NULL);
+        int y = MARGIN_Y + CHAR_H * 2;  // start a couple lines down
+        for (int i = 0; i < connect_status_count && i < CONNECT_STATUS_LINES; i++) {
+            display.setCursor(MARGIN_X, y);
+            display.print(connect_status[i]);
+            y += CHAR_H + 2;
+        }
+        drawTerminalStatusBar();
+    } while (display.nextPage());
+}
+
 void renderTerminal() {
     int y_start = 0;
     int region_h = SCREEN_H;
@@ -1516,15 +1629,19 @@ void displayTask(void* param) {
                 term_render_requested = false;
                 term_last_render = now;
 
-                xSemaphoreTake(state_mutex, portMAX_DELAY);
-                snapshotTerminalState();
-                xSemaphoreGive(state_mutex);
-
                 display_idle = false;
-                if (partial_count >= 20) {
-                    renderTerminalFullClean();
+                if (connect_status_count > 0) {
+                    renderConnectScreen();
                 } else {
-                    renderTerminal();
+                    xSemaphoreTake(state_mutex, portMAX_DELAY);
+                    snapshotTerminalState();
+                    xSemaphoreGive(state_mutex);
+
+                    if (partial_count >= 20) {
+                        renderTerminalFullClean();
+                    } else {
+                        renderTerminal();
+                    }
                 }
                 display_idle = true;
             }
@@ -1680,9 +1797,7 @@ bool handleNotepadKeyPress(int event_code) {
             mic_last_press = 0;
             app_mode = MODE_TERMINAL;
             if (!ssh_connected && !ssh_connecting) {
-                if (wifi_state != WIFI_CONNECTED && wifi_state != WIFI_CONNECTING) {
-                    wifiConnect();
-                }
+                sshConnectAsync();
             }
             return false;
         }
@@ -2340,14 +2455,9 @@ void loop() {
         last_net_check = millis();
         wifiCheck();
         updateBattery();
-        // Auto-connect SSH once WiFi is ready (if we switched to terminal and need it)
-        if (app_mode == MODE_TERMINAL && wifi_state == WIFI_CONNECTED
-            && !ssh_connected && !ssh_connecting) {
+        // Auto-connect SSH if we switched to terminal and need it
+        if (app_mode == MODE_TERMINAL && !ssh_connected && !ssh_connecting) {
             sshConnectAsync();
-        }
-        if (app_mode == MODE_TERMINAL && (wifi_state == WIFI_CONNECTED || wifi_state == WIFI_FAILED
-            || modem_state != MODEM_OFF)) {
-            term_render_requested = true;  // Update status bar
         }
     }
 
