@@ -71,7 +71,9 @@ Adafruit_TCA8418 keypad;
 #define KEYPAD_ROWS 4
 #define KEYPAD_COLS 10
 
-#define IS_SHIFT(r, c)  ((r) == 3 && ((c) == 5 || (c) == 9))
+#define IS_LSHIFT(r, c) ((r) == 3 && (c) == 9)
+#define IS_RSHIFT(r, c) ((r) == 3 && (c) == 5)
+#define IS_SHIFT(r, c)  (IS_LSHIFT(r, c) || IS_RSHIFT(r, c))
 #define IS_SYM(r, c)    ((r) == 3 && (c) == 8)
 #define IS_ALT(r, c)    ((r) == 2 && (c) == 0)
 #define IS_MIC(r, c)    ((r) == 3 && (c) == 6)
@@ -100,8 +102,16 @@ static const char keymap_sym[KEYPAD_ROWS][KEYPAD_COLS] = {
 
 // --- App Mode ---
 
-enum AppMode { MODE_NOTEPAD, MODE_TERMINAL };
+enum AppMode { MODE_NOTEPAD, MODE_TERMINAL, MODE_COMMAND };
 static volatile AppMode app_mode = MODE_NOTEPAD;
+
+// --- Command Processor State ---
+#define CMD_BUF_LEN 64
+static char cmd_buf[CMD_BUF_LEN + 1];
+static int  cmd_len = 0;
+static char cmd_result[128];  // Result message to display
+static bool cmd_result_valid = false;
+static AppMode cmd_return_mode = MODE_NOTEPAD;  // Mode to return to after command
 
 // --- Editor State (shared between cores, protected by mutex) ---
 
@@ -126,7 +136,8 @@ static int  cursor_pos  = 0;
 static int  scroll_line = 0;
 static bool shift_held  = false;
 static bool sym_mode    = false;
-static bool alt_mode    = false;
+static bool alt_mode    = false;   // Ctrl modifier in terminal, unused in notepad
+static bool nav_mode    = false;   // WASD arrow keys (right shift toggle)
 
 // Display task snapshot — private to core 0
 static char snap_buf[MAX_TEXT_LEN + 1];
@@ -136,6 +147,7 @@ static int  snap_scroll    = 0;
 static bool snap_shift     = false;
 static bool snap_sym       = false;
 static bool snap_alt       = false;
+static bool snap_nav       = false;
 
 // --- Terminal State (shared, protected by state_mutex) ---
 
@@ -755,6 +767,7 @@ void sshDisconnect() {
 }
 
 void sshReceiveTask(void* param);
+void renderCommandPrompt();
 
 bool hasNetwork() {
     return (wifi_state == WIFI_CONNECTED) || (modem_state == MODEM_PPP_UP);
@@ -969,6 +982,37 @@ void drawLinesRange(int first_line, int last_line) {
     }
 }
 
+// Battery reading via BQ27220 fuel gauge on I2C (address 0x55)
+#define BQ27220_ADDR 0x55
+#define BQ27220_REG_SOC 0x2C  // StateOfCharge register
+#define BQ27220_REG_VOLT 0x08 // Voltage register
+static int battery_pct = -1;  // -1 = unknown
+
+void updateBattery() {
+    Wire.beginTransmission(BQ27220_ADDR);
+    Wire.write(BQ27220_REG_SOC);
+    if (Wire.endTransmission(false) != 0) {
+        // Fuel gauge not responding, fall back to ADC
+        uint32_t raw = analogReadMilliVolts(4);
+        float voltage = (raw * 2.0f) / 1000.0f + 0.32f;
+        int pct = (int)((voltage - 3.3f) / (4.2f - 3.3f) * 100.0f);
+        if (pct < 0) pct = 0;
+        if (pct > 100) pct = 100;
+        battery_pct = pct;
+        return;
+    }
+    if (Wire.requestFrom((uint8_t)BQ27220_ADDR, (uint8_t)2) == 2) {
+        uint8_t lo = Wire.read();
+        uint8_t hi = Wire.read();
+        int soc = (hi << 8) | lo;
+        if (soc >= 0 && soc <= 100) battery_pct = soc;
+    }
+}
+
+// MIC double-tap detection
+static unsigned long mic_last_press = 0;
+#define MIC_DOUBLE_TAP_MS 350
+
 void drawStatusBar() {
     LayoutInfo info = computeLayoutFrom(snap_buf, snap_len, snap_cursor);
     int bar_y = SCREEN_H - STATUS_H;
@@ -977,12 +1021,23 @@ void drawStatusBar() {
     display.setFont(NULL);
     display.setCursor(2, bar_y + 1);
     char status[60];
-    snprintf(status, sizeof(status), "L%d C%d %dch %s%s%s",
-             info.cursor_line + 1, info.cursor_col + 1, snap_len,
-             snap_shift ? "[SH]" : "",
-             snap_sym ? "[SYM]" : "",
-             snap_alt ? "[NAV]" : "");
+    char mods[16] = "";
+    if (snap_shift) strcat(mods, "SH ");
+    if (snap_sym)   strcat(mods, "SY ");
+    if (snap_nav)   strcat(mods, "NV ");
+    snprintf(status, sizeof(status), "L%d C%d %s%s",
+             info.cursor_line + 1, info.cursor_col + 1,
+             mods,
+             battery_pct >= 0 ? "" : "");
+    // Append battery on right side if known
     display.print(status);
+    if (battery_pct >= 0) {
+        char batt[8];
+        snprintf(batt, sizeof(batt), "%d%%", battery_pct);
+        int bx = SCREEN_W - strlen(batt) * CHAR_W - 2;
+        display.setCursor(bx, bar_y + 1);
+        display.print(batt);
+    }
 }
 
 // --- Terminal Rendering ---
@@ -1032,31 +1087,34 @@ void drawTerminalStatusBar() {
     display.setCursor(2, bar_y + 1);
 
     char status[60];
-    // Connection info
-    const char* net_tag = "";
-    if (modem_state == MODEM_PPP_UP) net_tag = "4G";
-    else if (wifi_state == WIFI_CONNECTED) net_tag = "WiFi";
-
+    // Build compact connection string
     if (ssh_connecting) {
-        snprintf(status, sizeof(status), "[TERM] SSH connecting...");
+        snprintf(status, sizeof(status), "SSH...");
     } else if (ssh_connected) {
-        snprintf(status, sizeof(status), "[%s] %s@%s", net_tag, SSH_USER, SSH_HOST);
+        const char* net = (modem_state == MODEM_PPP_UP) ? "4G" : "WiFi";
+        snprintf(status, sizeof(status), "%s %s@%s", net, SSH_USER, SSH_HOST);
     } else if (modem_state == MODEM_PPP_UP) {
-        snprintf(status, sizeof(status), "[TERM] 4G ready");
-    } else if (modem_state == MODEM_REGISTERING) {
-        snprintf(status, sizeof(status), "[TERM] 4G registering...");
-    } else if (modem_state == MODEM_POWERING_ON || modem_state == MODEM_AT_OK) {
-        snprintf(status, sizeof(status), "[TERM] 4G starting...");
+        snprintf(status, sizeof(status), "4G OK");
+    } else if (modem_state >= MODEM_POWERING_ON && modem_state <= MODEM_REGISTERED) {
+        snprintf(status, sizeof(status), "4G...");
     } else if (modem_state == MODEM_FAILED) {
-        snprintf(status, sizeof(status), "[TERM] 4G failed");
+        snprintf(status, sizeof(status), "4G fail");
     } else if (wifi_state == WIFI_CONNECTED) {
-        snprintf(status, sizeof(status), "[TERM] %s", WiFi.localIP().toString().c_str());
+        snprintf(status, sizeof(status), "WiFi %s", WiFi.localIP().toString().c_str());
     } else if (wifi_state == WIFI_CONNECTING) {
-        snprintf(status, sizeof(status), "[TERM] WiFi...");
+        snprintf(status, sizeof(status), "WiFi...");
     } else {
-        snprintf(status, sizeof(status), "[TERM] No net (M=4G W=WiFi)");
+        snprintf(status, sizeof(status), "No net");
     }
     display.print(status);
+    // Battery on right side
+    if (battery_pct >= 0) {
+        char batt[8];
+        snprintf(batt, sizeof(batt), "%d%%", battery_pct);
+        int bx = SCREEN_W - strlen(batt) * CHAR_W - 2;
+        display.setCursor(bx, bar_y + 1);
+        display.print(batt);
+    }
 }
 
 void renderTerminal() {
@@ -1146,6 +1204,7 @@ void snapshotState() {
     snap_shift  = shift_held;
     snap_sym    = sym_mode;
     snap_alt    = alt_mode;
+    snap_nav    = nav_mode;
 }
 
 // --- Display Task (Core 0) ---
@@ -1175,6 +1234,9 @@ void displayTask(void* param) {
                 snapshotTerminalState();
                 xSemaphoreGive(state_mutex);
                 renderTerminalFullClean();
+            } else if (cur_mode == MODE_COMMAND) {
+                // Draw command prompt overlay
+                renderCommandPrompt();
             } else {
                 xSemaphoreTake(state_mutex, portMAX_DELAY);
                 snapshotState();
@@ -1208,6 +1270,16 @@ void displayTask(void* param) {
                 } else {
                     renderTerminal();
                 }
+            }
+            vTaskDelay(1);
+            continue;
+        }
+
+        // --- Command mode ---
+        if (cur_mode == MODE_COMMAND) {
+            if (render_requested) {
+                render_requested = false;
+                renderCommandPrompt();
             }
             vTaskDelay(1);
             continue;
@@ -1322,25 +1394,36 @@ bool handleNotepadKeyPress(int event_code) {
 
     if (row < 0 || row >= KEYPAD_ROWS || col_rev < 0 || col_rev >= KEYPAD_COLS) return false;
 
-    if (IS_SHIFT(row, col_rev)) { shift_held = !shift_held; return false; }
-    if (IS_SYM(row, col_rev))   { sym_mode = !sym_mode; return true; }
-    if (IS_ALT(row, col_rev))   { alt_mode = !alt_mode; return true; }
-    if (IS_MIC(row, col_rev))   {
-        app_mode = MODE_TERMINAL;
-        // Auto-connect WiFi when entering terminal mode
-        if (wifi_state == WIFI_IDLE || wifi_state == WIFI_FAILED) {
-            wifiConnect();
+    // Modifier keys
+    if (IS_LSHIFT(row, col_rev)) { shift_held = !shift_held; return false; }
+    if (IS_RSHIFT(row, col_rev)) { nav_mode = !nav_mode; return true; }
+    if (IS_SYM(row, col_rev))    { sym_mode = !sym_mode; return true; }
+    if (IS_ALT(row, col_rev))    { alt_mode = !alt_mode; return true; }
+    if (IS_MIC(row, col_rev))    {
+        unsigned long now = millis();
+        if (now - mic_last_press < MIC_DOUBLE_TAP_MS) {
+            // Double-tap: switch to terminal, auto-connect if needed
+            mic_last_press = 0;
+            app_mode = MODE_TERMINAL;
+            if (!ssh_connected && !ssh_connecting) {
+                if (wifi_state != WIFI_CONNECTED && wifi_state != WIFI_CONNECTING) {
+                    wifiConnect();
+                }
+            }
+            return false;
         }
-        return false;  // mode switch handled by display task
+        mic_last_press = now;
+        return false;  // Wait for potential double-tap
     }
-    if (IS_DEAD(row, col_rev))  { return false; }
+    if (IS_DEAD(row, col_rev))   { return false; }
 
-    if (alt_mode) {
+    // Nav mode: WASD arrows + backspace delete
+    if (nav_mode) {
         char base = keymap_lower[row][col_rev];
-        if (base == 'r')      cursorUp();
-        else if (base == 'd') cursorLeft();
-        else if (base == 'c') cursorDown();
-        else if (base == 'g') cursorRight();
+        if (base == 'w')      cursorUp();
+        else if (base == 'a') cursorLeft();
+        else if (base == 's') cursorDown();
+        else if (base == 'd') cursorRight();
         else if (base == '\b') {
             if (cursor_pos > 0) {
                 memmove(&text_buf[cursor_pos - 1], &text_buf[cursor_pos], text_len - cursor_pos);
@@ -1349,8 +1432,8 @@ bool handleNotepadKeyPress(int event_code) {
                 text_buf[text_len] = '\0';
             } else return false;
         }
-        // Alt+F: Force full e-ink refresh
-        else if (base == 'f') { alt_mode = false; partial_count = 100; render_requested = true; return false; }
+        // Alt+F: Force full e-ink refresh (works in nav mode too)
+        else if (alt_mode && base == 'f') { alt_mode = false; partial_count = 100; render_requested = true; return false; }
         else return false;
         return true;
     }
@@ -1399,62 +1482,48 @@ bool handleTerminalKeyPress(int event_code) {
 
     if (row < 0 || row >= KEYPAD_ROWS || col_rev < 0 || col_rev >= KEYPAD_COLS) return false;
 
-    if (IS_SHIFT(row, col_rev)) { shift_held = !shift_held; return false; }
-    if (IS_SYM(row, col_rev))   { sym_mode = !sym_mode; return true; }
-    if (IS_ALT(row, col_rev))   { alt_mode = !alt_mode; return true; }
-    if (IS_MIC(row, col_rev))   {
-        app_mode = MODE_NOTEPAD;
+    // Modifier keys
+    if (IS_LSHIFT(row, col_rev)) { shift_held = !shift_held; return false; }
+    if (IS_RSHIFT(row, col_rev)) { nav_mode = !nav_mode; return true; }
+    if (IS_SYM(row, col_rev))    { sym_mode = !sym_mode; return true; }
+    if (IS_ALT(row, col_rev))    { alt_mode = !alt_mode; return true; }
+    if (IS_MIC(row, col_rev))    {
+        unsigned long now = millis();
+        if (now - mic_last_press < MIC_DOUBLE_TAP_MS) {
+            // Double-tap: switch to notepad
+            mic_last_press = 0;
+            app_mode = MODE_NOTEPAD;
+            return false;
+        }
+        mic_last_press = now;
+        return false;  // Wait for potential double-tap
+    }
+    if (IS_DEAD(row, col_rev))   { return false; }
+
+    // Nav mode: WASD sends arrow escape sequences
+    if (nav_mode) {
+        char base = keymap_lower[row][col_rev];
+        if (base == 'w') { sshSendString("\x1b[A", 3); return false; }  // Up
+        if (base == 's') { sshSendString("\x1b[B", 3); return false; }  // Down
+        if (base == 'd') { sshSendString("\x1b[C", 3); return false; }  // Right
+        if (base == 'a') { sshSendString("\x1b[D", 3); return false; }  // Left
+        if (base == '\b') { sshSendKey(0x7F); return false; }
         return false;
     }
-    if (IS_DEAD(row, col_rev))  { return false; }
 
+    // Alt = Ctrl modifier
     if (alt_mode) {
         char base = keymap_lower[row][col_rev];
-        // Arrow keys
-        if (base == 'r') { sshSendString("\x1b[A", 3); return false; }  // Up
-        if (base == 'c') { sshSendString("\x1b[B", 3); return false; }  // Down
-        if (base == 'g') { sshSendString("\x1b[C", 3); return false; }  // Right
-        if (base == 'd') { sshSendString("\x1b[D", 3); return false; }  // Left
-        // Backspace in nav mode
-        if (base == '\b') { sshSendKey(0x7F); return false; }
-        // Alt+S: SSH connect
-        if (base == 's') { alt_mode = false; sshConnectAsync(); return true; }
-        // Alt+Q: SSH disconnect (but not Ctrl+Q — reserved for nav)
-        if (base == 'q') { alt_mode = false; sshDisconnect(); return true; }
-        // Alt+W: WiFi reconnect
-        if (base == 'w') { alt_mode = false; wifi_state = WIFI_IDLE; wifiConnect(); return true; }
-        // Alt+F: Force full e-ink refresh
-        if (base == 'f') { alt_mode = false; partial_count = 100; term_render_requested = true; return false; }
-        // Alt+M: Toggle 4G modem on/off
-        if (base == 'm') {
-            alt_mode = false;
-            if (modem_state == MODEM_OFF || modem_state == MODEM_FAILED) {
-                modemStartAsync();
-            } else {
-                modemStop();
-            }
-            return true;
-        }
-        // Alt+P: Paste notepad buffer into SSH
-        if (base == 'p') {
-            alt_mode = false;
-            if (ssh_connected && ssh_chan && text_len > 0) {
-                // Send notepad text_buf over SSH in small chunks
-                for (int i = 0; i < text_len; i += 64) {
-                    int chunk = (text_len - i > 64) ? 64 : (text_len - i);
-                    ssh_channel_write(ssh_chan, &text_buf[i], chunk);
-                    vTaskDelay(pdMS_TO_TICKS(10));
-                }
-            }
-            return true;
-        }
-        // Alt+Space: send Escape
-        if (base == ' ') { sshSendKey(0x1B); return false; }
-        // Alt+Enter: send Tab
-        if (base == '\n') { sshSendKey('\t'); return false; }
-        // All other Alt+letter: send Ctrl+letter (a=0x01 .. z=0x1A)
+        // Alt+Space = Escape
+        if (base == ' ') { sshSendKey(0x1B); alt_mode = false; return true; }
+        // Alt+Enter = Tab
+        if (base == '\n') { sshSendKey('\t'); alt_mode = false; return true; }
+        // Alt+Backspace = DEL
+        if (base == '\b') { sshSendKey(0x7F); alt_mode = false; return false; }
+        // Alt+letter = Ctrl+letter (a=0x01 .. z=0x1A)
         if (base >= 'a' && base <= 'z') {
             sshSendKey(base - 'a' + 1);
+            alt_mode = false;
             return false;
         }
         return false;
@@ -1469,7 +1538,7 @@ bool handleTerminalKeyPress(int event_code) {
 
     if (c == '\b') {
         sshSendKey(0x7F);  // Send DEL
-        return false;  // no local echo
+        return false;
     }
 
     if (c == '\n') {
@@ -1480,10 +1549,152 @@ bool handleTerminalKeyPress(int event_code) {
     if (c >= ' ' && c <= '~') {
         sshSendKey(c);
         if (shift_held) shift_held = false;
-        return false;  // no local echo
+        return false;
     }
 
     return false;
+}
+
+// --- Command Processor ---
+
+void executeCommand(const char* cmd) {
+    // Single-char shortcuts: p=paste, d=disconnect, r=refresh, 4=4g, s=status, ?/h=help, q=quit
+    if (strcmp(cmd, "p") == 0 || strcmp(cmd, "paste") == 0) {
+        if (!ssh_connected || !ssh_chan) {
+            snprintf(cmd_result, sizeof(cmd_result), "SSH not connected");
+        } else if (text_len == 0) {
+            snprintf(cmd_result, sizeof(cmd_result), "Notepad empty");
+        } else {
+            for (int i = 0; i < text_len; i += 64) {
+                int chunk = (text_len - i > 64) ? 64 : (text_len - i);
+                ssh_channel_write(ssh_chan, &text_buf[i], chunk);
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            snprintf(cmd_result, sizeof(cmd_result), "Pasted %d chars", text_len);
+        }
+    } else if (strcmp(cmd, "d") == 0 || strcmp(cmd, "dc") == 0) {
+        sshDisconnect();
+        snprintf(cmd_result, sizeof(cmd_result), "Disconnected");
+    } else if (strcmp(cmd, "r") == 0 || strcmp(cmd, "refresh") == 0) {
+        partial_count = 100;
+        snprintf(cmd_result, sizeof(cmd_result), "Full refresh queued");
+    } else if (strcmp(cmd, "4") == 0 || strcmp(cmd, "4g") == 0) {
+        if (modem_state == MODEM_OFF || modem_state == MODEM_FAILED) {
+            modemStartAsync();
+            snprintf(cmd_result, sizeof(cmd_result), "4G starting...");
+        } else if (modem_state == MODEM_PPP_UP) {
+            modemStop();
+            snprintf(cmd_result, sizeof(cmd_result), "4G stopped");
+        } else {
+            snprintf(cmd_result, sizeof(cmd_result), "4G busy...");
+        }
+    } else if (strcmp(cmd, "s") == 0 || strcmp(cmd, "status") == 0) {
+        const char* ws = "off";
+        if (wifi_state == WIFI_CONNECTED) ws = "ok";
+        else if (wifi_state == WIFI_CONNECTING) ws = "...";
+        const char* ms = "off";
+        if (modem_state == MODEM_PPP_UP) ms = "ok";
+        else if (modem_state >= MODEM_POWERING_ON && modem_state <= MODEM_REGISTERED) ms = "...";
+        else if (modem_state == MODEM_FAILED) ms = "fail";
+        snprintf(cmd_result, sizeof(cmd_result), "WiFi:%s 4G:%s SSH:%s Bat:%d%%",
+                 ws, ms, ssh_connected ? "ok" : "off", battery_pct);
+    } else if (strcmp(cmd, "?") == 0 || strcmp(cmd, "h") == 0 || strcmp(cmd, "help") == 0) {
+        snprintf(cmd_result, sizeof(cmd_result), "(p)aste (d)c (r)efresh (4)g (s)tatus");
+    } else if (strlen(cmd) == 0) {
+        cmd_result_valid = false;
+        return;
+    } else {
+        snprintf(cmd_result, sizeof(cmd_result), "? (p)aste (d)c (r)ef (4)g (s)tat");
+    }
+    cmd_result_valid = true;
+}
+
+bool handleCommandKeyPress(int event_code) {
+    int key_num = (event_code & 0x7F);
+    int idx = key_num - 1;
+    int row = idx / KEYPAD_COLS;
+    int col_raw = idx % KEYPAD_COLS;
+    int col_rev = (KEYPAD_COLS - 1) - col_raw;
+
+    if (row < 0 || row >= KEYPAD_ROWS || col_rev < 0 || col_rev >= KEYPAD_COLS) return false;
+
+    if (IS_SHIFT(row, col_rev)) { shift_held = !shift_held; return false; }
+    if (IS_SYM(row, col_rev))   { sym_mode = !sym_mode; return true; }
+    if (IS_ALT(row, col_rev))   { return false; }
+    if (IS_MIC(row, col_rev))   {
+        // MIC exits command mode back to previous mode
+        app_mode = cmd_return_mode;
+        return false;
+    }
+    if (IS_DEAD(row, col_rev))  { return false; }
+
+    char c;
+    if (sym_mode)        c = keymap_sym[row][col_rev];
+    else if (shift_held) c = keymap_upper[row][col_rev];
+    else                 c = keymap_lower[row][col_rev];
+
+    if (c == 0) return false;
+
+    if (c == '\b') {
+        if (cmd_len > 0) {
+            cmd_len--;
+            cmd_buf[cmd_len] = '\0';
+            return true;
+        }
+        return false;
+    }
+
+    if (c == '\n') {
+        executeCommand(cmd_buf);
+        cmd_len = 0;
+        cmd_buf[0] = '\0';
+        return true;
+    }
+
+    if (c >= ' ' && c <= '~' && cmd_len < CMD_BUF_LEN) {
+        cmd_buf[cmd_len++] = c;
+        cmd_buf[cmd_len] = '\0';
+        if (shift_held) shift_held = false;
+        return true;
+    }
+
+    return false;
+}
+
+void renderCommandPrompt() {
+    partial_count++;
+    int prompt_y = SCREEN_H - STATUS_H - CHAR_H * 3;  // 3 lines from bottom
+    int region_h = SCREEN_H - prompt_y;
+
+    display.setPartialWindow(0, prompt_y, SCREEN_W, region_h);
+    display.firstPage();
+    do {
+        display.fillScreen(GxEPD_WHITE);
+        display.setTextColor(GxEPD_BLACK);
+        display.setFont(NULL);
+
+        // Show result from last command
+        if (cmd_result_valid) {
+            display.setCursor(MARGIN_X, prompt_y + 1);
+            display.print(cmd_result);
+        }
+
+        // Draw prompt line
+        int py = prompt_y + CHAR_H + 2;
+        display.setCursor(MARGIN_X, py);
+        display.print("> ");
+        display.print(cmd_buf);
+        // Cursor
+        int cx = MARGIN_X + (cmd_len + 2) * CHAR_W;
+        display.fillRect(cx, py - 1, CHAR_W, CHAR_H, GxEPD_BLACK);
+
+        // Status bar
+        int bar_y = SCREEN_H - STATUS_H;
+        display.fillRect(0, bar_y, SCREEN_W, STATUS_H, GxEPD_BLACK);
+        display.setTextColor(GxEPD_WHITE);
+        display.setCursor(2, bar_y + 1);
+        display.print("[CMD] ? for help | MIC to exit");
+    } while (display.nextPage());
 }
 
 // --- Setup & Loop ---
@@ -1553,21 +1764,40 @@ void setup() {
         0               // core 0
     );
 
-    Serial.println("Ready. Start typing! Press MIC for terminal mode.");
+    Serial.println("Ready. Double-tap MIC to switch modes. Single-tap MIC for commands.");
     Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
 }
 
 // Core 1: keyboard polling — never blocks on display
 void loop() {
-    // Check WiFi / modem status periodically
+    // Check WiFi / modem / battery status periodically
     static unsigned long last_net_check = 0;
     if (millis() - last_net_check > 1000) {
         last_net_check = millis();
         wifiCheck();
+        updateBattery();
+        // Auto-connect SSH once WiFi is ready (if we switched to terminal and need it)
+        if (app_mode == MODE_TERMINAL && wifi_state == WIFI_CONNECTED
+            && !ssh_connected && !ssh_connecting) {
+            sshConnectAsync();
+        }
         if (app_mode == MODE_TERMINAL && (wifi_state == WIFI_CONNECTED || wifi_state == WIFI_FAILED
             || modem_state != MODEM_OFF)) {
             term_render_requested = true;  // Update status bar
         }
+    }
+
+    // MIC single-tap timeout → open command processor
+    if (mic_last_press > 0 && (millis() - mic_last_press >= MIC_DOUBLE_TAP_MS)) {
+        mic_last_press = 0;
+        xSemaphoreTake(state_mutex, portMAX_DELAY);
+        cmd_return_mode = app_mode;
+        cmd_len = 0;
+        cmd_buf[0] = '\0';
+        cmd_result_valid = false;
+        app_mode = MODE_COMMAND;
+        xSemaphoreGive(state_mutex);
+        render_requested = true;
     }
 
     while (keypad.available() > 0) {
@@ -1576,18 +1806,25 @@ void loop() {
 
         xSemaphoreTake(state_mutex, portMAX_DELAY);
         bool needs_render = false;
-        if (app_mode == MODE_NOTEPAD) {
+        AppMode mode = app_mode;
+        if (mode == MODE_NOTEPAD) {
             needs_render = handleNotepadKeyPress(ev);
-        } else {
+        } else if (mode == MODE_TERMINAL) {
             needs_render = handleTerminalKeyPress(ev);
+        } else if (mode == MODE_COMMAND) {
+            needs_render = handleCommandKeyPress(ev);
         }
         xSemaphoreGive(state_mutex);
 
         if (needs_render) {
-            if (app_mode == MODE_NOTEPAD) {
+            // After command execution, mode may have changed
+            AppMode cur = app_mode;
+            if (cur == MODE_NOTEPAD) {
                 render_requested = true;
-            } else {
+            } else if (cur == MODE_TERMINAL) {
                 term_render_requested = true;
+            } else if (cur == MODE_COMMAND) {
+                render_requested = true;
             }
         }
     }
