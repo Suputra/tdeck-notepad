@@ -1594,16 +1594,22 @@ void sshReceiveTask(void* param) {
 void drawLinesRange(int first_line, int last_line) {
     int text_line = 0, col = 0;
     int start_i = 0;
+    bool found_start = false;
 
     // Fast-forward to snap_scroll line to avoid scanning entire buffer
     int target_line = snap_scroll + first_line;
     if (target_line > 0) {
         for (int i = 0; i < snap_len; i++) {
-            if (text_line >= target_line) { start_i = i; break; }
+            if (text_line >= target_line) { start_i = i; found_start = true; break; }
             if (snap_buf[i] == '\n') { text_line++; col = 0; }
             else { col++; if (col >= COLS_PER_LINE) { text_line++; col = 0; } }
         }
-        if (text_line < target_line) return; // not enough lines
+        // Handle trailing empty line (cursor after a newline): we may only
+        // reach target_line exactly after consuming the final character.
+        if (!found_start) {
+            if (text_line < target_line) return; // not enough lines
+            start_i = snap_len;
+        }
     }
 
     // Batch buffer for accumulating runs of chars on the same line
