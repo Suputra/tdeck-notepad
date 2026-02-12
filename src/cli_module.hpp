@@ -1,7 +1,5 @@
 // --- Command Processor ---
 
-#include "poweroff_art_shaded.hpp"
-
 // --- SCP Upload ---
 
 static volatile bool upload_running = false;
@@ -257,10 +255,61 @@ static const char poweroff_art[] PROGMEM =
     "WNWWWWWWWWWk;,'''.........',,;;;;,,,,,,,'............'''''',,,;::,''''.'''',,'''''''''...'''.':::;'.......'',:c,,:cc::;;,,,,,,\n";
 
 #define POWEROFF_ART_LINES 92
+#define POWEROFF_ART_PX_W  2
+#define POWEROFF_ART_PX_H  3
+
+struct PoweroffBlockGlyph {
+    char ch;
+    uint8_t shape_bits;
+    uint8_t shade;
+};
+
+static constexpr PoweroffBlockGlyph kPoweroffBlockGlyphs[] = {
+    { ' ', 0b000000, 0 },
+    { '\'', 0b110000, 3 },
+    { ',', 0b000011, 3 },
+    { '.', 0b000001, 3 },
+    { ':', 0b010001, 3 },
+    { ';', 0b010011, 3 },
+    { 'c', 0b111111, 1 },
+    { 'd', 0b111111, 2 },
+    { 'k', 0b111111, 2 },
+    { 'l', 0b111111, 1 },
+    { 'o', 0b111111, 2 },
+    { 'x', 0b111111, 2 },
+    { '0', 0b111111, 3 },
+    { 'K', 0b111111, 3 },
+    { 'N', 0b111111, 3 },
+    { 'O', 0b111111, 3 },
+    { 'W', 0b111111, 3 },
+    { 'X', 0b111111, 3 },
+};
+
+inline const PoweroffBlockGlyph& poweroffBlockGlyphFor(char ch) {
+    static constexpr PoweroffBlockGlyph fallback = { '?', 0b111111, 2 };
+    for (const auto& glyph : kPoweroffBlockGlyphs) {
+        if (glyph.ch == ch) return glyph;
+    }
+    return fallback;
+}
+
+inline uint8_t poweroffShadeMask(uint8_t shade, int row, int col) {
+    const bool odd = ((row + col) & 1) != 0;
+    switch (shade) {
+        case 1: return odd ? 0b101011 : 0b110101;
+        case 2: return odd ? 0b111011 : 0b110111;
+        default: return 0b111111;
+    }
+}
+
+inline bool poweroffBitOn(uint8_t bits, int gx, int gy) {
+    int bit = (POWEROFF_ART_PX_H - 1 - gy) * POWEROFF_ART_PX_W + (POWEROFF_ART_PX_W - 1 - gx);
+    return (bits & (1 << bit)) != 0;
+}
 
 void powerOff() {
     // Render ASCII art as pixel bitmap on e-ink, then deep sleep
-    const int art_height = POWEROFF_ART_LINES * POWEROFF_ART_CELL_H;
+    const int art_height = POWEROFF_ART_LINES * POWEROFF_ART_PX_H;
     const int y_offset = (SCREEN_H - art_height) / 2;
 
     display.setFullWindow();
@@ -275,19 +324,20 @@ void powerOff() {
                 row++;
                 col = 0;
             } else {
-                const PoweroffGlyph& glyph = poweroffGlyphFor(*p);
-                int cell_x = col * POWEROFF_ART_CELL_W;
-                int cell_y = y_offset + row * POWEROFF_ART_CELL_H;
+                const PoweroffBlockGlyph& glyph = poweroffBlockGlyphFor(*p);
+                if (glyph.shape_bits != 0) {
+                    int cell_x = col * POWEROFF_ART_PX_W;
+                    int cell_y = y_offset + row * POWEROFF_ART_PX_H;
+                    uint8_t draw_bits = glyph.shape_bits & poweroffShadeMask(glyph.shade, row, col);
 
-                for (int gy = 0; gy < POWEROFF_ART_CELL_H; gy++) {
-                    uint8_t row_bits = glyph.rows[gy];
-                    for (int gx = 0; gx < POWEROFF_ART_CELL_W; gx++) {
-                        if ((row_bits & (1 << (POWEROFF_ART_CELL_W - 1 - gx))) == 0) continue;
-                        int px = cell_x + gx;
-                        int py = cell_y + gy;
-                        if (px < 0 || py < 0 || px >= SCREEN_W || py >= SCREEN_H) continue;
-                        if (!poweroffShadeAllowsPixel(glyph.shade, px, py)) continue;
-                        display.drawPixel(px, py, GxEPD_BLACK);
+                    for (int gy = 0; gy < POWEROFF_ART_PX_H; gy++) {
+                        for (int gx = 0; gx < POWEROFF_ART_PX_W; gx++) {
+                            if (!poweroffBitOn(draw_bits, gx, gy)) continue;
+                            int px = cell_x + gx;
+                            int py = cell_y + gy;
+                            if (px < 0 || py < 0 || px >= SCREEN_W || py >= SCREEN_H) continue;
+                            display.drawPixel(px, py, GxEPD_BLACK);
+                        }
                     }
                 }
                 col++;
