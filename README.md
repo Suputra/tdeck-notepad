@@ -1,6 +1,6 @@
 # T-Deck Pro Notepad
 
-Firmware for the LilyGo T-Deck Pro — a pocket notepad with SSH terminal, file manager and WireGuard VPN.
+Firmware for the LilyGo T-Deck Pro — a pocket notepad with SSH terminal, file manager, WireGuard VPN, and BLE HID keyboard phone pairing.
 
 ## Build & Flash
 
@@ -30,7 +30,7 @@ source scripts/setup-pio.sh
 
 ## SD Card Config
 
-Credentials are loaded from a `/CONFIG` file on the SD card (FAT32). Section-based format with `#` comments and blank lines ignored. Section headers are `# wifi`, `# ssh`, `# vpn`.
+Credentials are loaded from a `/CONFIG` file on the SD card (FAT32). Section-based format with `#` comments and blank lines ignored. Section headers are `# wifi`, `# ssh`, `# vpn`, `# bt`.
 
 ```
 # wifi (SSID/password pairs; blank or missing password means open WiFi)
@@ -59,9 +59,22 @@ password
 51820
 # optional: DNS server to use while VPN is active
 10.0.0.1
+
+# bt (optional)
+TDeck-Pro
+# optional 6-digit static passkey for secure pairing
+123456
 ```
 
 Open WiFi entries: put only the SSID and leave the password line blank (or end the WiFi section right after the SSID).
+
+If `# bt` is enabled, the device advertises as a BLE HID keyboard and keeps advertising whenever disconnected. After first bonding/pairing with your phone, iOS can reconnect using standard keyboard behavior.
+`# bt` parsing is positional:
+1. Device name
+2. Optional 6-digit passkey
+
+If `# bt` section is missing, BLE stays disabled.
+HID access requires encryption, so iOS should prompt to pair/bond on first access.
 
 ## Usage
 
@@ -79,6 +92,15 @@ Double-tap **MIC** to switch to terminal mode. The device connects WiFi, tries S
 
 - **Alt** — acts as ctrl - alt + space -> esc
 
+### Keyboard Mode (BLE HID)
+
+Single-tap **MIC** to open command mode, run `k` to enter keyboard mode, then keypresses are sent to the paired phone over BLE HID.
+
+- **MIC** single tap: open command prompt
+- `k` again from command prompt: exit keyboard mode
+- **Alt** acts as Command modifier for phone shortcuts
+- `p` in command mode while returning to keyboard mode pastes the current notepad buffer to the phone
+
 ### Command Processor
 
 Single-tap **MIC** from either mode to open the command prompt (bottom half of screen).
@@ -92,9 +114,11 @@ Single-tap **MIC** from either mode to open the command prompt (bottom half of s
 | `r` / `rm <file>` | Delete a file |
 | `u` / `upload` | SCP all SD files to `~/tdeck` on SSH host |
 | `d` / `download` | SCP `~/tdeck` files to SD card |
-| `p` / `paste` | Paste notepad to SSH |
+| `k` / `keyboard` | Toggle BLE keyboard mode on/off |
+| `p` / `paste` | Paste notepad to SSH, or to BLE phone when returning to keyboard mode |
 | `dc` | Disconnect SSH |
 | `ws` / `scan` | Scan WiFi and retry known APs manually |
+| `bt` / `bluetooth` | BLE status (`bt status`), send typed text (`bt send <txt>`) |
 | `f` / `refresh` | Force full e-ink refresh |
 | `s` / `status` | Show WiFi/SSH/VPN/battery status |
 | `?` / `h` / `help` | Show help |
@@ -104,6 +128,7 @@ Single-tap **MIC** from either mode to open the command prompt (bottom half of s
 Firmware entry point remains `src/main.cpp` (setup/loop and global state), while major firmware components are split into flat module headers in `src/`:
 
 - `src/network_module.hpp` (WiFi, SSH, VPN connectivity)
+- `src/bluetooth_module.hpp` (BLE HID keyboard, pairing/bonding, auto-advertise, keepalive typing)
 - `src/screen_module.hpp` (display rendering/task logic)
 - `src/keyboard_module.hpp` (keyboard input + mode handlers)
 - `src/cli_module.hpp` (command parsing, SCP helpers, poweroff flow)
@@ -118,6 +143,6 @@ Shared configuration/constants are split into:
 Runtime uses two FreeRTOS cores:
 
 - **Core 0** — e-ink display rendering
-- **Core 1** — keyboard polling, WiFi/SSH/VPN, file I/O
+- **Core 1** — keyboard polling, WiFi/SSH/VPN/BLE, file I/O
 
 SPI bus shared between e-ink and SD card via cooperative `sd_busy`/`display_idle` flags (no mutex).

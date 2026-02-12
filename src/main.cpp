@@ -7,6 +7,7 @@
 #include <libssh/libssh.h>
 #include <esp_task_wdt.h>
 #include <esp_sleep.h>
+#include <driver/gpio.h>
 #include <esp_netif.h>
 #include <lwip/dns.h>
 #include <SD.h>
@@ -27,6 +28,11 @@ static char config_ssh_vpn_host[64] = "";
 static int  config_ssh_port       = 22;
 static char config_ssh_user[64]   = "";
 static char config_ssh_pass[64]   = "";
+
+// --- Bluetooth Config (loaded from SD /CONFIG) ---
+static bool     config_bt_enabled = false;
+static char     config_bt_name[32] = "TDeck-Pro";
+static uint32_t config_bt_passkey = 0; // 6-digit optional static PIN
 
 // --- VPN Config (loaded from SD /CONFIG) ---
 static char   config_vpn_privkey[64] = "";
@@ -63,7 +69,7 @@ Adafruit_TCA8418 keypad;
 
 // --- App Mode ---
 
-enum AppMode { MODE_NOTEPAD, MODE_TERMINAL, MODE_COMMAND };
+enum AppMode { MODE_NOTEPAD, MODE_TERMINAL, MODE_KEYBOARD, MODE_COMMAND };
 static volatile AppMode app_mode = MODE_NOTEPAD;
 
 // --- Editor State (shared between cores, protected by mutex) ---
@@ -73,6 +79,7 @@ static volatile AppMode app_mode = MODE_NOTEPAD;
 static char cmd_buf[CMD_BUF_LEN + 1];
 static int  cmd_len = 0;
 static AppMode cmd_return_mode = MODE_NOTEPAD;  // Mode to return to after command
+static AppMode keyboard_return_mode = MODE_NOTEPAD;
 
 // Multi-line command result (half screen)
 #define CMD_RESULT_LINES 13
@@ -87,6 +94,9 @@ static bool file_modified = false;
 static SemaphoreHandle_t state_mutex;
 static volatile bool render_requested = false;
 static volatile bool poweroff_requested = false;
+static unsigned long boot_pressed_since = 0;
+static bool boot_sleep_latched = false;
+static constexpr unsigned long BOOT_SLEEP_HOLD_MS = 0;
 
 // Editor state — written by core 1 (keyboard), read by core 0 (display)
 static char text_buf[MAX_TEXT_LEN + 1];
@@ -808,7 +818,8 @@ void sdLoadConfig() {
     // # wifi — pairs of ssid/password (variable count)
     // # ssh — host, port, user, pass, [optional vpn-host]
     // # vpn — ENABLE, privkey, pubkey, psk, ip, endpoint, port, [optional dns]
-    enum { SEC_WIFI, SEC_SSH, SEC_VPN } section = SEC_WIFI;
+    // # bt  — optional BLE HID settings (name, [optional 6-digit pin])
+    enum { SEC_WIFI, SEC_SSH, SEC_VPN, SEC_BT } section = SEC_WIFI;
     int field = 0;  // field index within current section
     bool wifi_expect_ssid = true;
     char wifi_ssid[64] = "";
@@ -833,6 +844,26 @@ void sdLoadConfig() {
         }
     };
 
+    auto parseBtPasskey = [&](const String& value, uint32_t* out) -> bool {
+        if (!out) return false;
+        if (value.length() != 6) return false;
+        uint32_t pin = 0;
+        for (size_t i = 0; i < 6; i++) {
+            char c = value.charAt(i);
+            if (c < '0' || c > '9') return false;
+            pin = pin * 10 + (uint32_t)(c - '0');
+        }
+        if (pin < 100000 || pin > 999999) return false;
+        *out = pin;
+        return true;
+    };
+
+    auto setBtName = [&](const String& value) {
+        if (value.length() == 0) return;
+        strncpy(config_bt_name, value.c_str(), sizeof(config_bt_name) - 1);
+        config_bt_name[sizeof(config_bt_name) - 1] = '\0';
+    };
+
     while (f.available()) {
         String line = f.readStringUntil('\n');
         line.trim();
@@ -847,6 +878,12 @@ void sdLoadConfig() {
             if (line.indexOf("wifi") >= 0)     { section = SEC_WIFI; field = 0; wifi_expect_ssid = true; wifi_ssid[0] = '\0'; }
             else if (line.indexOf("ssh") >= 0) { section = SEC_SSH; field = 0; }
             else if (line.indexOf("vpn") >= 0) { section = SEC_VPN; field = 0; }
+            else if (line.indexOf("bt") >= 0)  {
+                section = SEC_BT;
+                field = 0;
+                // Section presence enables BLE.
+                config_bt_enabled = true;
+            }
             continue;
         }
 
@@ -918,12 +955,35 @@ void sdLoadConfig() {
                     break;
             }
             field++;
+        } else if (section == SEC_BT) {
+            // Strict positional parsing:
+            // line 1: device name
+            // line 2 (optional): 6-digit passkey
+            if (field == 0) {
+                setBtName(line);
+                field = 1;
+                continue;
+            } else if (field == 1) {
+                uint32_t parsed = 0;
+                if (parseBtPasskey(line, &parsed)) {
+                    config_bt_passkey = parsed;
+                } else {
+                    Serial.printf("SD: BT pin ignored (need 6 digits): %s\n", line.c_str());
+                }
+                field++;
+                continue;
+            }
+            field++;
         }
     }
     flushPendingOpenWiFi();
     f.close();
-    Serial.printf("SD: config loaded (%d WiFi APs, host=%s, VPN=%s)\n",
-                  config_wifi_count, config_ssh_host, vpnConfigured() ? "yes" : "no");
+    Serial.printf("SD: config loaded (%d WiFi APs, host=%s, VPN=%s, BT=%s, BT name=%s)\n",
+                  config_wifi_count,
+                  config_ssh_host,
+                  vpnConfigured() ? "yes" : "no",
+                  config_bt_enabled ? "on" : "off",
+                  config_bt_name);
 }
 
 // --- File I/O Helpers ---
@@ -1155,6 +1215,7 @@ void autoSaveDirty() {
 }
 
 #include "network_module.hpp"
+#include "bluetooth_module.hpp"
 #include "screen_module.hpp"
 #include "keyboard_module.hpp"
 #include "cli_module.hpp"
@@ -1165,6 +1226,20 @@ void setup() {
     Serial.begin(115200);
     delay(500);
     Serial.println("T-Deck Pro Notepad + Terminal starting...");
+
+    // Clear any GPIO deep-sleep holds from a prior power-off cycle.
+    gpio_hold_dis((gpio_num_t)BOARD_LORA_EN);
+    gpio_hold_dis((gpio_num_t)BOARD_GPS_EN);
+    gpio_hold_dis((gpio_num_t)BOARD_1V8_EN);
+    gpio_hold_dis((gpio_num_t)BOARD_KEYBOARD_LED);
+    gpio_hold_dis((gpio_num_t)BOARD_LORA_CS);
+    gpio_hold_dis((gpio_num_t)BOARD_LORA_RST);
+    gpio_hold_dis((gpio_num_t)BOARD_SD_CS);
+    gpio_hold_dis((gpio_num_t)BOARD_EPD_CS);
+    gpio_deep_sleep_hold_dis();
+
+    // BOOT is GPIO0 (active-low). Hold to trigger the same deep sleep path as "off".
+    pinMode(BOARD_BOOT_PIN, INPUT_PULLUP);
 
     // Disable task watchdog — SSH blocking calls would trigger it
     esp_task_wdt_deinit();
@@ -1208,6 +1283,7 @@ void setup() {
     // Init SD card and load config (before display task to avoid SPI contention)
     sdInit();
     sdLoadConfig();
+    btInit();
 
     // Init terminal buffer
     terminalClear();
@@ -1226,12 +1302,30 @@ void setup() {
         0               // core 0
     );
 
-    Serial.println("Ready. Double-tap MIC to switch modes. Single-tap MIC for commands.");
+    Serial.println("Ready. Double-tap MIC toggles notepad/terminal. Single-tap MIC for commands.");
     Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
 }
 
 // Core 1: keyboard polling — never blocks on display
 void loop() {
+    // Press BOOT to request power-off (same behavior as the "off" command).
+    if (!poweroff_requested) {
+        unsigned long now = millis();
+        bool boot_pressed = (digitalRead(BOARD_BOOT_PIN) == LOW);
+        if (boot_pressed) {
+            if (boot_pressed_since == 0) {
+                boot_pressed_since = now;
+            }
+            if (!boot_sleep_latched && (now - boot_pressed_since >= BOOT_SLEEP_HOLD_MS)) {
+                boot_sleep_latched = true;
+                poweroff_requested = true;
+            }
+        } else {
+            boot_pressed_since = 0;
+            boot_sleep_latched = false;
+        }
+    }
+
     // Check WiFi status (lightweight cached state check)
     static unsigned long last_net_check = 0;
     if (millis() - last_net_check > 5000) {
@@ -1247,6 +1341,13 @@ void loop() {
     if (millis() - last_batt_check > 30000) {
         last_batt_check = millis();
         updateBattery();
+    }
+
+    // BLE maintenance: auto-advertise and reconnect handling.
+    static unsigned long last_bt_check = 0;
+    if (millis() - last_bt_check > 250) {
+        last_bt_check = millis();
+        btPoll();
     }
 
     // MIC single-tap timeout → open command processor
@@ -1274,6 +1375,8 @@ void loop() {
             needs_render = handleNotepadKeyPress(ev);
         } else if (mode == MODE_TERMINAL) {
             needs_render = handleTerminalKeyPress(ev);
+        } else if (mode == MODE_KEYBOARD) {
+            needs_render = handleKeyboardModeKeyPress(ev);
         } else if (mode == MODE_COMMAND) {
             needs_render = handleCommandKeyPress(ev);
         }
@@ -1285,6 +1388,8 @@ void loop() {
             if (cur == MODE_NOTEPAD) {
                 render_requested = true;
             } else if (cur == MODE_TERMINAL) {
+                term_render_requested = true;
+            } else if (cur == MODE_KEYBOARD) {
                 term_render_requested = true;
             } else if (cur == MODE_COMMAND) {
                 render_requested = true;

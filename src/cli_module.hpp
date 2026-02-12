@@ -1,122 +1,354 @@
 // --- Command Processor ---
 
-// --- SCP Upload ---
+// --- Streaming Upload/Download ---
 
 static volatile bool upload_running = false;
 static volatile int upload_done_count = 0;
 static volatile int upload_total_count = 0;
+static volatile bool download_running = false;
+static volatile int download_done_count = 0;
+static volatile int download_total_count = 0;
+static volatile uint32_t upload_bytes_done = 0;
+static volatile uint32_t upload_bytes_total = 0;
+static volatile uint32_t download_bytes_done = 0;
+static volatile uint32_t download_bytes_total = 0;
+static volatile uint32_t upload_started_ms = 0;
+static volatile uint32_t download_started_ms = 0;
+static volatile uint32_t upload_last_ui_ms = 0;
+static volatile uint32_t download_last_ui_ms = 0;
 
-bool scpPushFile(ssh_scp scp, const char* sd_path, const char* remote_name) {
+static constexpr size_t TRANSFER_CHUNK_SIZE = 256;
+static constexpr size_t TRANSFER_LINE_MAX = 192;
+
+uint32_t satAddU32(uint32_t a, uint32_t b) {
+    if (UINT32_MAX - a < b) return UINT32_MAX;
+    return a + b;
+}
+
+void formatBytesCompact(uint32_t bytes, char* out, size_t out_len) {
+    if (!out || out_len < 2) return;
+    if (bytes < 1024) {
+        snprintf(out, out_len, "%luB", (unsigned long)bytes);
+        return;
+    }
+    if (bytes < 1024UL * 1024UL) {
+        unsigned long whole = bytes / 1024UL;
+        unsigned long frac = (bytes % 1024UL) * 10UL / 1024UL;
+        snprintf(out, out_len, "%lu.%luK", whole, frac);
+        return;
+    }
+    unsigned long whole = bytes / (1024UL * 1024UL);
+    unsigned long frac = (bytes % (1024UL * 1024UL)) * 10UL / (1024UL * 1024UL);
+    snprintf(out, out_len, "%lu.%luM", whole, frac);
+}
+
+void maybeTransferUiRefresh(volatile uint32_t* last_ms) {
+    uint32_t now = millis();
+    if (now - *last_ms >= 250) {
+        *last_ms = now;
+        render_requested = true;
+    }
+}
+
+bool isSafeTransferName(const char* name) {
+    if (!name || name[0] == '\0') return false;
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return false;
+    for (const char* p = name; *p; p++) {
+        char c = *p;
+        bool ok = (c >= 'a' && c <= 'z') ||
+                  (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') ||
+                  c == '.' || c == '_' || c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+bool sshWriteAll(ssh_channel channel, const uint8_t* data, size_t len) {
+    size_t offset = 0;
+    while (offset < len) {
+        int n = ssh_channel_write(channel, data + offset, len - offset);
+        if (n <= 0) return false;
+        offset += (size_t)n;
+    }
+    return true;
+}
+
+bool sshReadExact(ssh_channel channel, uint8_t* out, size_t len) {
+    size_t offset = 0;
+    while (offset < len) {
+        int n = ssh_channel_read(channel, out + offset, len - offset, 0);
+        if (n <= 0) return false;
+        offset += (size_t)n;
+    }
+    return true;
+}
+
+bool sshReadLine(ssh_channel channel, char* out, size_t out_len) {
+    if (!out || out_len < 2) return false;
+    size_t pos = 0;
+    while (true) {
+        char c = 0;
+        int n = ssh_channel_read(channel, &c, 1, 0);
+        if (n <= 0) return false;
+        if (c == '\r') continue;
+        if (c == '\n') {
+            out[pos] = '\0';
+            return true;
+        }
+        if (pos + 1 >= out_len) return false;
+        out[pos++] = c;
+    }
+}
+
+bool sshOpenExecChannel(const char* command, ssh_channel* out_channel) {
+    if (!ssh_connected || !ssh_sess || !command || !out_channel) return false;
+    ssh_channel channel = ssh_channel_new(ssh_sess);
+    if (!channel) return false;
+    if (ssh_channel_open_session(channel) != SSH_OK) {
+        ssh_channel_free(channel);
+        return false;
+    }
+    if (ssh_channel_request_exec(channel, command) != SSH_OK) {
+        ssh_channel_close(channel);
+        ssh_channel_free(channel);
+        return false;
+    }
+    *out_channel = channel;
+    return true;
+}
+
+int sshCloseExecChannel(ssh_channel channel) {
+    if (!channel) return -1;
+    ssh_channel_send_eof(channel);
+    ssh_channel_close(channel);
+    int exit_status = ssh_channel_get_exit_status(channel);
+    ssh_channel_free(channel);
+    return exit_status;
+}
+
+bool uploadStreamFile(ssh_channel channel, const char* file_name) {
+    if (!isSafeTransferName(file_name)) return false;
+
+    String path = "/" + String(file_name);
     sdAcquire();
-    File f = SD.open(sd_path, FILE_READ);
-    if (!f) { sdRelease(); return false; }
+    File f = SD.open(path.c_str(), FILE_READ);
+    if (!f) {
+        sdRelease();
+        return false;
+    }
     size_t sz = f.size();
 
-    // Read entire file into memory (files are small, max 4K)
-    char buf[MAX_TEXT_LEN];
-    int n = f.read((uint8_t*)buf, sz);
+    char header[TRANSFER_LINE_MAX];
+    int hdr_len = snprintf(header, sizeof(header), "FILE %lu %s\n", (unsigned long)sz, file_name);
+    if (hdr_len <= 0 || hdr_len >= (int)sizeof(header)) {
+        f.close();
+        sdRelease();
+        return false;
+    }
+    if (!sshWriteAll(channel, (const uint8_t*)header, (size_t)hdr_len)) {
+        f.close();
+        sdRelease();
+        return false;
+    }
+
+    uint8_t buf[TRANSFER_CHUNK_SIZE];
+    while (true) {
+        int n = f.read(buf, sizeof(buf));
+        if (n < 0) {
+            f.close();
+            sdRelease();
+            return false;
+        }
+        if (n == 0) break;
+        if (!sshWriteAll(channel, buf, (size_t)n)) {
+            f.close();
+            sdRelease();
+            return false;
+        }
+        upload_bytes_done = satAddU32(upload_bytes_done, (uint32_t)n);
+        maybeTransferUiRefresh(&upload_last_ui_ms);
+    }
+
     f.close();
     sdRelease();
 
-    if (n <= 0) return false;
-    if (ssh_scp_push_file(scp, remote_name, n, 0644) != SSH_OK) return false;
-    return ssh_scp_write(scp, buf, n) == SSH_OK;
+    const char nl = '\n';
+    return sshWriteAll(channel, (const uint8_t*)&nl, 1);
 }
+
+bool parseDownloadHeader(const char* line, size_t* out_size, char* out_name, size_t out_name_len) {
+    if (!line || !out_size || !out_name || out_name_len < 2) return false;
+    if (strncmp(line, "FILE ", 5) != 0) return false;
+
+    const char* p = line + 5;
+    char* end = NULL;
+    unsigned long sz = strtoul(p, &end, 10);
+    if (!end || end == p || *end != ' ') return false;
+
+    const char* name = end + 1;
+    if (!isSafeTransferName(name)) return false;
+
+    strncpy(out_name, name, out_name_len - 1);
+    out_name[out_name_len - 1] = '\0';
+    *out_size = (size_t)sz;
+    return true;
+}
+
+bool downloadStreamFile(ssh_channel channel, const char* file_name, size_t file_size) {
+    String path = "/" + String(file_name);
+    uint8_t buf[TRANSFER_CHUNK_SIZE];
+    size_t remaining = file_size;
+
+    sdAcquire();
+    SD.remove(path.c_str());
+    File f = SD.open(path.c_str(), FILE_WRITE);
+    bool file_ok = (bool)f;
+
+    while (remaining > 0) {
+        size_t chunk = remaining > sizeof(buf) ? sizeof(buf) : remaining;
+        if (!sshReadExact(channel, buf, chunk)) {
+            if (f) f.close();
+            sdRelease();
+            return false;
+        }
+        if (file_ok) {
+            size_t w = f.write(buf, chunk);
+            if (w != chunk) file_ok = false;
+        }
+        download_bytes_done = satAddU32(download_bytes_done, (uint32_t)chunk);
+        maybeTransferUiRefresh(&download_last_ui_ms);
+        remaining -= chunk;
+    }
+    if (f) f.close();
+    sdRelease();
+
+    char sep = 0;
+    if (!sshReadExact(channel, (uint8_t*)&sep, 1)) return false;
+    if (sep != '\n') return false;
+    return file_ok;
+}
+
+static const char* REMOTE_UPLOAD_STREAM_CMD =
+    "/bin/sh -c '"
+    "set -eu; "
+    "dest=\"$HOME/tdeck\"; "
+    "mkdir -p \"$dest\"; "
+    "while IFS= read -r header; do "
+    "  [ \"$header\" = \"DONE\" ] && break; "
+    "  case \"$header\" in FILE\\ *) ;; *) exit 31;; esac; "
+    "  meta=${header#FILE }; "
+    "  len=${meta%% *}; "
+    "  name=${meta#* }; "
+    "  case \"$len\" in \"\"|*[!0-9]*) exit 32;; esac; "
+    "  case \"$name\" in \"\"|*/*) exit 33;; esac; "
+    "  tmp=\"$dest/.${name}.tmp.$$\"; "
+    "  dd bs=1 count=\"$len\" of=\"$tmp\" 2>/dev/null || exit 34; "
+    "  IFS= read -r _sep || exit 35; "
+    "  mv \"$tmp\" \"$dest/$name\" || exit 36; "
+    "done; "
+    "printf \"OK\\n\""
+    "'";
+
+static const char* REMOTE_DOWNLOAD_STREAM_CMD =
+    "/bin/sh -c '"
+    "set -eu; "
+    "src=\"$HOME/tdeck\"; "
+    "[ -d \"$src\" ] || { printf \"DONE\\n\"; exit 0; }; "
+    "for f in \"$src\"/*; do "
+    "  [ -f \"$f\" ] || continue; "
+    "  name=${f##*/}; "
+    "  case \"$name\" in \"\"|*/*) continue;; esac; "
+    "  size=$(wc -c < \"$f\" | tr -d \"[:space:]\"); "
+    "  printf \"FILE %s %s\\n\" \"$size\" \"$name\"; "
+    "  cat \"$f\"; "
+    "  printf \"\\n\"; "
+    "done; "
+    "printf \"DONE\\n\""
+    "'";
 
 void uploadTask(void* param) {
     upload_running = true;
     upload_done_count = 0;
+    upload_bytes_done = 0;
+    upload_bytes_total = 0;
+    upload_started_ms = millis();
+    upload_last_ui_ms = upload_started_ms;
 
     // List flat files at root
     int n = listDirectory("/");
     upload_total_count = 0;
     for (int i = 0; i < n; i++) {
-        if (!file_list[i].is_dir) upload_total_count++;
+        if (!file_list[i].is_dir && isSafeTransferName(file_list[i].name)) {
+            upload_total_count++;
+            uint32_t fsz = file_list[i].size > UINT32_MAX ? UINT32_MAX : (uint32_t)file_list[i].size;
+            upload_bytes_total = satAddU32(upload_bytes_total, fsz);
+        }
     }
     cmdSetResult("Uploading %d files...", upload_total_count);
     render_requested = true;
 
-    // Create SCP session using existing SSH connection's session
-    ssh_scp scp = ssh_scp_new(ssh_sess, SSH_SCP_WRITE, "tdeck");
-    if (!scp) {
-        cmdSetResult("SCP: init failed");
-        render_requested = true;
-        upload_running = false;
-        vTaskDelete(NULL);
-        return;
-    }
-    if (ssh_scp_init(scp) != SSH_OK) {
-        cmdSetResult("SCP: %s", ssh_get_error(ssh_sess));
-        ssh_scp_free(scp);
+    if (upload_total_count == 0) {
+        cmdSetResult("No valid files to upload");
         render_requested = true;
         upload_running = false;
         vTaskDelete(NULL);
         return;
     }
 
-    // Push each file
+    ssh_channel channel = NULL;
+    if (!sshOpenExecChannel(REMOTE_UPLOAD_STREAM_CMD, &channel)) {
+        cmdSetResult("Upload start failed: %s", ssh_get_error(ssh_sess));
+        render_requested = true;
+        upload_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    bool stream_ok = true;
     for (int i = 0; i < n; i++) {
         if (file_list[i].is_dir) continue;
-        String path = "/" + String(file_list[i].name);
-        if (scpPushFile(scp, path.c_str(), file_list[i].name)) {
-            upload_done_count++;
-            render_requested = true;
+        if (!isSafeTransferName(file_list[i].name)) continue;
+        if (!uploadStreamFile(channel, file_list[i].name)) {
+            stream_ok = false;
+            break;
         }
+        upload_done_count++;
+        render_requested = true;
     }
 
-    ssh_scp_close(scp);
-    ssh_scp_free(scp);
+    if (stream_ok) {
+        const char done[] = "DONE\n";
+        stream_ok = sshWriteAll(channel, (const uint8_t*)done, sizeof(done) - 1);
+    }
+    ssh_channel_send_eof(channel);
 
-    cmdSetResult("Upload done: %d files", upload_done_count);
+    char reply[TRANSFER_LINE_MAX];
+    bool got_reply = stream_ok && sshReadLine(channel, reply, sizeof(reply));
+    int exit_status = sshCloseExecChannel(channel);
+
+    if (stream_ok && got_reply && strcmp(reply, "OK") == 0 && exit_status == 0) {
+        cmdSetResult("Upload done: %d files", upload_done_count);
+    } else {
+        cmdSetResult("Upload failed (%d/%d)", upload_done_count, upload_total_count);
+    }
     render_requested = true;
     upload_running = false;
     vTaskDelete(NULL);
-}
-
-// --- SCP Download ---
-
-static volatile bool download_running = false;
-static volatile int download_done_count = 0;
-static volatile int download_total_count = 0;
-
-bool scpPullFile(ssh_scp scp, const char* remote_name, size_t size) {
-    char buf[MAX_TEXT_LEN];
-    size_t remaining = size;
-    size_t offset = 0;
-    while (remaining > 0) {
-        size_t chunk = remaining > sizeof(buf) ? sizeof(buf) : remaining;
-        int n = ssh_scp_read(scp, buf + offset, chunk);
-        if (n < 0) return false;
-        offset += n;
-        remaining -= n;
-    }
-
-    String path = "/" + String(remote_name);
-    sdAcquire();
-    File f = SD.open(path.c_str(), FILE_WRITE);
-    if (!f) { sdRelease(); return false; }
-    f.write((uint8_t*)buf, offset);
-    f.close();
-    sdRelease();
-    return true;
 }
 
 void downloadTask(void* param) {
     download_running = true;
     download_done_count = 0;
     download_total_count = 0;
+    download_bytes_done = 0;
+    download_bytes_total = 0;
+    download_started_ms = millis();
+    download_last_ui_ms = download_started_ms;
 
-    ssh_scp scp = ssh_scp_new(ssh_sess, SSH_SCP_READ | SSH_SCP_RECURSIVE, "tdeck");
-    if (!scp) {
-        cmdSetResult("SCP: init failed");
-        render_requested = true;
-        download_running = false;
-        vTaskDelete(NULL);
-        return;
-    }
-    if (ssh_scp_init(scp) != SSH_OK) {
-        cmdSetResult("SCP: %s", ssh_get_error(ssh_sess));
-        ssh_scp_free(scp);
+    ssh_channel channel = NULL;
+    if (!sshOpenExecChannel(REMOTE_DOWNLOAD_STREAM_CMD, &channel)) {
+        cmdSetResult("Download start failed: %s", ssh_get_error(ssh_sess));
         render_requested = true;
         download_running = false;
         vTaskDelete(NULL);
@@ -126,33 +358,44 @@ void downloadTask(void* param) {
     cmdSetResult("Downloading...");
     render_requested = true;
 
-    int r;
-    while ((r = ssh_scp_pull_request(scp)) != SSH_SCP_REQUEST_EOF) {
-        if (r == SSH_SCP_REQUEST_NEWDIR) {
-            ssh_scp_accept_request(scp);
-            continue;
+    bool stream_ok = true;
+    bool saw_done = false;
+    while (stream_ok) {
+        char line[TRANSFER_LINE_MAX];
+        if (!sshReadLine(channel, line, sizeof(line))) {
+            stream_ok = false;
+            break;
         }
-        if (r == SSH_SCP_REQUEST_ENDDIR) {
-            continue;
+        if (strcmp(line, "DONE") == 0) {
+            saw_done = true;
+            break;
         }
-        if (r == SSH_SCP_REQUEST_NEWFILE) {
-            size_t size = ssh_scp_request_get_size(scp);
-            const char* name = ssh_scp_request_get_filename(scp);
-            download_total_count++;
-            ssh_scp_accept_request(scp);
-            if (scpPullFile(scp, name, size)) {
-                download_done_count++;
-                render_requested = true;
-            }
-            continue;
+
+        size_t file_size = 0;
+        char file_name[64];
+        if (!parseDownloadHeader(line, &file_size, file_name, sizeof(file_name))) {
+            stream_ok = false;
+            break;
         }
-        if (r == SSH_ERROR) break;
+
+        download_total_count++;
+        uint32_t fsz = file_size > UINT32_MAX ? UINT32_MAX : (uint32_t)file_size;
+        download_bytes_total = satAddU32(download_bytes_total, fsz);
+        if (downloadStreamFile(channel, file_name, file_size)) {
+            download_done_count++;
+            render_requested = true;
+        } else {
+            stream_ok = false;
+        }
     }
 
-    ssh_scp_close(scp);
-    ssh_scp_free(scp);
+    int exit_status = sshCloseExecChannel(channel);
 
-    cmdSetResult("Download done: %d files", download_done_count);
+    if (stream_ok && saw_done && exit_status == 0) {
+        cmdSetResult("Download done: %d files", download_done_count);
+    } else {
+        cmdSetResult("Download failed (%d/%d)", download_done_count, download_total_count);
+    }
     render_requested = true;
     download_running = false;
     vTaskDelete(NULL);
@@ -307,6 +550,30 @@ inline bool poweroffBitOn(uint8_t bits, int gx, int gy) {
     return (bits & (1 << bit)) != 0;
 }
 
+inline void poweroffDriveAndHold(int pin, bool level_high) {
+    if (pin < 0) return;
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, level_high ? HIGH : LOW);
+    gpio_hold_en((gpio_num_t)pin);
+}
+
+inline void poweroffQuiesceHardware() {
+    // Turn off controllable module rails and indicator load switches.
+    poweroffDriveAndHold(BOARD_LORA_EN, LOW);
+    poweroffDriveAndHold(BOARD_GPS_EN, LOW);
+    poweroffDriveAndHold(BOARD_1V8_EN, LOW);
+    poweroffDriveAndHold(BOARD_KEYBOARD_LED, LOW);
+
+    // Keep shared SPI devices deselected and radio reset asserted.
+    poweroffDriveAndHold(BOARD_LORA_CS, HIGH);
+    poweroffDriveAndHold(BOARD_SD_CS, HIGH);
+    poweroffDriveAndHold(BOARD_EPD_CS, HIGH);
+    poweroffDriveAndHold(BOARD_LORA_RST, LOW);
+
+    // Persist these GPIO levels through deep sleep.
+    gpio_deep_sleep_hold_en();
+}
+
 void powerOff() {
     // Render ASCII art as pixel bitmap on e-ink, then deep sleep
     const int art_height = POWEROFF_ART_LINES * POWEROFF_ART_PX_H;
@@ -349,9 +616,20 @@ void powerOff() {
     delay(100);
     display.hibernate();
 
+    // Stop BLE advertising/connection before sleeping.
+    btShutdown();
+
+    // Stop shared buses before sleeping.
+    if (sd_mounted) SD.end();
+    SPI.end();
+    Wire.end();
+
     // Disconnect WiFi
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
+
+    // Drive externally switched rails fully off and keep them latched in sleep.
+    poweroffQuiesceHardware();
 
     // Enter deep sleep with no wakeup source (only reset wakes)
     esp_deep_sleep_start();
@@ -522,34 +800,50 @@ void executeCommand(const char* cmd) {
     } else if (strcmp(word, "u") == 0 || strcmp(word, "upload") == 0) {
         if (!ssh_connected) {
             cmdSetResult("SSH not connected");
+        } else if (download_running) {
+            cmdSetResult("Transfer in progress...");
         } else if (upload_running) {
             cmdSetResult("Upload in progress...");
         } else {
-            char mkdir_cmd[64];
-            snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p ~/tdeck\n");
-            ssh_channel_write(ssh_chan, mkdir_cmd, strlen(mkdir_cmd));
-            vTaskDelay(pdMS_TO_TICKS(500));
-            char drain[256];
-            ssh_channel_read_nonblocking(ssh_chan, drain, sizeof(drain), 0);
             xTaskCreatePinnedToCore(uploadTask, "upload", 16384, NULL, 1, NULL, 1);
             cmdSetResult("Starting upload...");
         }
     } else if (strcmp(word, "d") == 0 || strcmp(word, "download") == 0) {
         if (!ssh_connected) {
             cmdSetResult("SSH not connected");
+        } else if (upload_running) {
+            cmdSetResult("Transfer in progress...");
         } else if (download_running) {
             cmdSetResult("Download in progress...");
         } else {
             xTaskCreatePinnedToCore(downloadTask, "download", 16384, NULL, 1, NULL, 1);
             cmdSetResult("Starting download...");
         }
+    } else if (strcmp(word, "k") == 0 || strcmp(word, "keyboard") == 0) {
+        if (cmd_return_mode == MODE_KEYBOARD) {
+            AppMode back = keyboard_return_mode;
+            if (back == MODE_COMMAND || back == MODE_KEYBOARD) back = MODE_NOTEPAD;
+            cmd_return_mode = back;
+            app_mode = back;
+            cmdSetResult("Keyboard mode off");
+        } else {
+            keyboard_return_mode = cmd_return_mode;
+            cmd_return_mode = MODE_KEYBOARD;
+            app_mode = MODE_KEYBOARD;
+            if (btIsConnected()) cmdSetResult("Keyboard mode on");
+            else cmdSetResult("Keyboard mode on (BT waiting)");
+        }
     }
     // --- Other commands ---
     else if (strcmp(word, "p") == 0 || strcmp(word, "paste") == 0) {
-        if (!ssh_connected || !ssh_chan) {
-            cmdSetResult("SSH not connected");
-        } else if (text_len == 0) {
+        if (text_len == 0) {
             cmdSetResult("Notepad empty");
+        } else if (cmd_return_mode == MODE_KEYBOARD) {
+            size_t sent = btTypeTextN(text_buf, (size_t)text_len, 0);
+            if (sent == 0) cmdSetResult("BT not connected");
+            else cmdSetResult("BT pasted %d/%d chars", (int)sent, text_len);
+        } else if (!ssh_connected || !ssh_chan) {
+            cmdSetResult("SSH not connected");
         } else {
             for (int i = 0; i < text_len; i += 64) {
                 int chunk = (text_len - i > 64) ? 64 : (text_len - i);
@@ -566,16 +860,38 @@ void executeCommand(const char* cmd) {
     } else if (strcmp(word, "f") == 0 || strcmp(word, "refresh") == 0) {
         partial_count = 100;
         cmdSetResult("Full refresh queued");
+    } else if (strcmp(word, "bt") == 0 || strcmp(word, "bluetooth") == 0) {
+        if (arg[0] == '\0' || strcmp(arg, "status") == 0) {
+            cmdClearResult();
+            cmdAddLine("BT:%s %s", btStatusShort(), btIsBonded() ? "bonded" : "unpaired");
+            cmdAddLine("Name:%s", config_bt_name);
+            cmdAddLine("Mode:HID keyboard");
+            if (btPeerAddress()[0] != '\0') {
+                cmdAddLine("Peer:%s", btPeerAddress());
+            }
+            if (config_bt_passkey >= 100000 && config_bt_passkey <= 999999) {
+                cmdAddLine("PIN:%06u", (unsigned)config_bt_passkey);
+            }
+        } else if (strncmp(arg, "send ", 5) == 0) {
+            size_t sent = btTypeText(arg + 5);
+            if (sent > 0) cmdSetResult("BT sent %d", (int)sent);
+            else cmdSetResult("BT not connected");
+        } else {
+            cmdSetResult("bt status|send <txt>");
+        }
     } else if (strcmp(word, "s") == 0 || strcmp(word, "status") == 0) {
         const char* ws = "off";
         if (wifi_state == WIFI_CONNECTED) ws = "ok";
         else if (wifi_state == WIFI_CONNECTING) ws = "...";
         else if (wifi_state == WIFI_FAILED) ws = "fail";
         cmdClearResult();
-        cmdAddLine("WiFi:%s SSH:%s", ws, ssh_connected ? "ok" : "off");
+        cmdAddLine("WiFi:%s SSH:%s BT:%s", ws, ssh_connected ? "ok" : "off", btStatusShort());
         if (wifi_last_fail_ssid[0] != '\0') {
             cmdAddLine("WiFi fail:%s", wifi_last_fail_ssid);
             cmdAddLine("Why:%s", wifi_last_fail_reason);
+        }
+        if (btPeerAddress()[0] != '\0') {
+            cmdAddLine("BT peer:%s", btPeerAddress());
         }
         cmdAddLine("Bat:%d%% Heap:%dK", battery_pct, ESP.getFreeHeap() / 1024);
         if (current_file.length() > 0) cmdAddLine("File:%s%s", current_file.c_str(), file_modified ? "*" : "");
@@ -585,8 +901,8 @@ void executeCommand(const char* cmd) {
         cmdClearResult();
         cmdAddLine("(l)ist (e)dit (w)rite (n)ew");
         cmdAddLine("(r)m (u)pload (d)ownload");
-        cmdAddLine("(p)aste dc (ws)/scan re(f)resh");
-        cmdAddLine("(s)tatus off (h)elp");
+        cmdAddLine("(k)eyboard (p)aste dc (ws)/scan bt");
+        cmdAddLine("re(f)resh (s)tatus off (h)elp");
     } else {
         cmdSetResult("Unknown: %s (?=help)", word);
     }
@@ -724,17 +1040,42 @@ void renderCommandPrompt() {
         display.setTextColor(GxEPD_WHITE);
         display.setCursor(2, bar_y + 1);
         if (upload_running) {
-            char ul[40];
-            snprintf(ul, sizeof(ul), "Upload: %d/%d", (int)upload_done_count, (int)upload_total_count);
+            uint32_t done = upload_bytes_done;
+            uint32_t total = upload_bytes_total;
+            uint32_t elapsed_ms = millis() - upload_started_ms;
+            uint32_t rate = (elapsed_ms > 0)
+                ? (uint32_t)(((uint64_t)done * 1000ULL) / elapsed_ms)
+                : 0;
+            char done_s[12], total_s[12], rate_s[12];
+            char ul[56];
+            formatBytesCompact(done, done_s, sizeof(done_s));
+            formatBytesCompact(total, total_s, sizeof(total_s));
+            formatBytesCompact(rate, rate_s, sizeof(rate_s));
+            snprintf(ul, sizeof(ul), "U %d/%d %s/%s %s/s",
+                     (int)upload_done_count, (int)upload_total_count,
+                     done_s, total_s, rate_s);
             display.print(ul);
         } else if (download_running) {
-            char dl[40];
-            snprintf(dl, sizeof(dl), "Download: %d/%d", (int)download_done_count, (int)download_total_count);
+            uint32_t done = download_bytes_done;
+            uint32_t total = download_bytes_total;
+            uint32_t elapsed_ms = millis() - download_started_ms;
+            uint32_t rate = (elapsed_ms > 0)
+                ? (uint32_t)(((uint64_t)done * 1000ULL) / elapsed_ms)
+                : 0;
+            char done_s[12], total_s[12], rate_s[12];
+            char dl[56];
+            formatBytesCompact(done, done_s, sizeof(done_s));
+            formatBytesCompact(total, total_s, sizeof(total_s));
+            formatBytesCompact(rate, rate_s, sizeof(rate_s));
+            snprintf(dl, sizeof(dl), "D %d/%d %s/%s %s/s",
+                     (int)download_done_count, (int)download_total_count,
+                     done_s, total_s, rate_s);
             display.print(dl);
         } else if (cmd_edit_picker_active) {
             display.print("[PICK] WASD nav ENTER open");
         } else {
-            display.print("[CMD] ? help | MIC exit");
+            if (cmd_return_mode == MODE_KEYBOARD) display.print("[CMD] k exit | p paste | MIC return");
+            else display.print("[CMD] ? help | MIC exit");
         }
     } while (display.nextPage());
 }
