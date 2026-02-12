@@ -164,7 +164,7 @@ static const char poweroff_art[] PROGMEM =
     "                    .\n"
     "                    .ll,.\n"
     "                     ,,'.\n"
-    "\n"
+    "                        ..\n"
     "                         ..\n"
     "                          ..            ...',;;;;,..\n"
     "                           ..       ..',;:::;;:;;:,'.\n"
