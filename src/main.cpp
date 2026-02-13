@@ -1219,6 +1219,7 @@ void autoSaveDirty() {
 #include "screen_module.hpp"
 #include "keyboard_module.hpp"
 #include "cli_module.hpp"
+#include "serial_agent_module.hpp"
 
 // --- Setup & Loop ---
 
@@ -1308,6 +1309,8 @@ void setup() {
 
 // Core 1: keyboard polling — never blocks on display
 void loop() {
+    agentPollSerial();
+
     // Press BOOT to request power-off (same behavior as the "off" command).
     if (!poweroff_requested) {
         unsigned long now = millis();

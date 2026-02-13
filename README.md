@@ -22,6 +22,42 @@ pio run -t upload    # flash via USB-C
 pio device monitor   # serial output
 ```
 
+### Debug automation build
+
+Two PlatformIO environments are available:
+
+```bash
+pio run -e T-Deck-Pro -t upload        # production (agent protocol disabled)
+pio run -e T-Deck-Pro-debug -t upload  # debug (agent protocol enabled)
+```
+
+With debug firmware flashed, you can drive the device over serial:
+
+```bash
+uv sync
+uv run scripts/tdeck_agent.py --boot-wait 2 "PING" "STATE"
+uv run scripts/tdeck_agent.py "MIC SINGLE" "WAIT 500" "STATE"
+uv run scripts/tdeck_agent.py "MIC DOUBLE" "WAIT 300" "STATE"
+```
+
+You can also capture screen evidence from a webcam:
+
+```bash
+uv run scripts/capture_webcam.py --image artifacts/screen.jpg
+```
+
+Recommended end-to-end smoke command (write + render + capture + checks):
+
+```bash
+uv run scripts/agent_smoke.py --camera-device 1 --boot-wait 2
+```
+
+If camera index is wrong or captures are black:
+
+```bash
+uv run scripts/probe_cameras.py --max-index 5
+```
+
 Alternative setup script:
 
 ```bash
