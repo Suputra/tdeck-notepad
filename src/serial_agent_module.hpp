@@ -21,7 +21,6 @@ static const char* agentModeName(AppMode mode) {
     switch (mode) {
         case MODE_NOTEPAD:  return "notepad";
         case MODE_TERMINAL: return "terminal";
-        case MODE_KEYBOARD: return "keyboard";
         case MODE_COMMAND:  return "command";
         default:            return "unknown";
     }
@@ -54,8 +53,6 @@ static bool agentDispatchEventLocked(int event_code) {
         needs_render = handleNotepadKeyPress(event_code);
     } else if (mode == MODE_TERMINAL) {
         needs_render = handleTerminalKeyPress(event_code);
-    } else if (mode == MODE_KEYBOARD) {
-        needs_render = handleKeyboardModeKeyPress(event_code);
     } else if (mode == MODE_COMMAND) {
         needs_render = handleCommandKeyPress(event_code);
     }
@@ -196,7 +193,7 @@ static char* agentTrim(char* s) {
 
 static void agentReportStateLocked() {
     Serial.printf(
-        "AGENT OK STATE mode=%s text_len=%d cursor=%d scroll=%d cmd_len=%d wifi=%d ssh=%d bt=%s heap=%d\n",
+        "AGENT OK STATE mode=%s text_len=%d cursor=%d scroll=%d cmd_len=%d wifi=%d ssh=%d bt=%s heap=%d up=%d/%d up_run=%d down=%d/%d down_run=%d\n",
         agentModeName(app_mode),
         text_len,
         cursor_pos,
@@ -205,7 +202,13 @@ static void agentReportStateLocked() {
         (int)wifi_state,
         ssh_connected ? 1 : 0,
         btStatusShort(),
-        ESP.getFreeHeap()
+        ESP.getFreeHeap(),
+        upload_done_count,
+        upload_total_count,
+        upload_running ? 1 : 0,
+        download_done_count,
+        download_total_count,
+        download_running ? 1 : 0
     );
 }
 
@@ -228,7 +231,7 @@ static void agentRunCommand(char* line) {
         return;
     }
     if (strcasecmp(p, "HELP") == 0) {
-        agentReplyOk("commands=PING HELP MODE STATE KEY KEYNAME PRESS CHAR TEXT MIC CMD WAIT RENDER BOOTOFF");
+        agentReplyOk("commands=PING HELP MODE STATE RESULT KEY KEYNAME PRESS CHAR TEXT MIC CMD WAIT RENDER BOOTOFF");
         return;
     }
 
@@ -263,6 +266,16 @@ static void agentRunCommand(char* line) {
 
     if (strcasecmp(p, "STATE") == 0) {
         agentReportStateLocked();
+        xSemaphoreGive(state_mutex);
+        return;
+    }
+
+    if (strcasecmp(p, "RESULT") == 0) {
+        if (!cmd_result_valid || cmd_result_count <= 0 || cmd_result[0][0] == '\0') {
+            agentReplyOk("RESULT (empty)");
+        } else {
+            agentReplyOk("RESULT %s", cmd_result[0]);
+        }
         xSemaphoreGive(state_mutex);
         return;
     }

@@ -17,6 +17,7 @@ except ImportError as exc:  # pragma: no cover - import error path
 
 
 STATE_RE = re.compile(r"AGENT OK STATE .*text_len=(\d+)")
+DEFAULT_CAMERA_SOURCE = "http://10.0.44.199:4747/"
 
 
 def run_command(cmd: list[str]) -> str:
@@ -42,11 +43,20 @@ def analyze_image(path: Path) -> tuple[float, float, float]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Write marker text to T-Deck notepad, capture webcam frame, and run basic checks."
+        description="Write marker text to T-Deck notepad, capture a frame, and run basic checks."
     )
     parser.add_argument("--port", help="Serial port for T-Deck device (optional auto-detect)")
-    parser.add_argument("--camera-device", type=int, default=1, help="Webcam device index")
-    parser.add_argument("--warmup", type=float, default=2.0, help="Webcam warmup seconds")
+    parser.add_argument(
+        "--camera-source",
+        default=DEFAULT_CAMERA_SOURCE,
+        help="Camera source URL or device index string",
+    )
+    parser.add_argument(
+        "--camera-device",
+        type=int,
+        help="Deprecated webcam device index; overrides --camera-source",
+    )
+    parser.add_argument("--warmup", type=float, default=2.0, help="Camera warmup seconds")
     parser.add_argument("--wait-ms", type=int, default=1800, help="Wait after render before capture")
     parser.add_argument("--boot-wait", type=float, default=0.0, help="Seconds to read boot logs first")
     parser.add_argument("--marker", help="Text marker to write on notepad")
@@ -66,6 +76,7 @@ def main() -> int:
         print("[smoke] Use a marker without '0' or pass custom keypad-safe text via --marker.")
         return 6
     expected_len = len(marker)
+    camera_source = str(args.camera_device) if args.camera_device is not None else args.camera_source
 
     artifacts = Path("artifacts")
     artifacts.mkdir(parents=True, exist_ok=True)
@@ -105,8 +116,8 @@ def main() -> int:
     cap_cmd = [
         sys.executable,
         "scripts/capture_webcam.py",
-        "--device",
-        str(args.camera_device),
+        "--source",
+        camera_source,
         "--warmup",
         str(args.warmup),
         "--image",

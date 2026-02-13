@@ -10,18 +10,19 @@ uv sync
 ## Preferred Smoke Test
 ```bash
 pio run -e T-Deck-Pro-debug -t upload
-uv run scripts/agent_smoke.py --camera-device 1 --boot-wait 2
+uv run scripts/agent_smoke.py --boot-wait 2
 ```
 
 `agent_smoke.py` performs write + render + capture + basic checks and prints `PASS`/`FAIL`.
 Use `--marker` without `0` if you need a custom marker.
+Default camera source is `http://10.0.44.199:4747/`.
 
 ## If Camera Selection Is Wrong
 ```bash
 uv run scripts/probe_cameras.py --max-index 5
 ```
 
-Use a working index (`opened=1`, `frame=1`, non-zero mean/std) as `--camera-device`.
+Use a working index (`opened=1`, `frame=1`, non-zero mean/std) as `--camera-source "<idx>"`.
 
 ## Manual Scenario Path
 1. Flash debug firmware:
@@ -31,7 +32,7 @@ Use a working index (`opened=1`, `frame=1`, non-zero mean/std) as `--camera-devi
 3. Drive scenario:
    `uv run scripts/tdeck_agent.py "CMD new" "TEXT test-123" "RENDER" "WAIT 1200" "STATE"`
 4. Capture artifact:
-   `uv run scripts/capture_webcam.py --device <idx> --image artifacts/test-123.jpg`
+   `uv run scripts/capture_webcam.py --image artifacts/test-123.jpg`
 5. Evaluate from protocol results + artifact.
 
 Keypress-driven examples:

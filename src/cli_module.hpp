@@ -19,6 +19,7 @@ static volatile uint32_t download_last_ui_ms = 0;
 
 static constexpr size_t TRANSFER_CHUNK_SIZE = 256;
 static constexpr size_t TRANSFER_LINE_MAX = 192;
+static constexpr uint32_t TRANSFER_TASK_STACK = 8192;
 
 uint32_t satAddU32(uint32_t a, uint32_t b) {
     if (UINT32_MAX - a < b) return UINT32_MAX;
@@ -805,8 +806,14 @@ void executeCommand(const char* cmd) {
         } else if (upload_running) {
             cmdSetResult("Upload in progress...");
         } else {
-            xTaskCreatePinnedToCore(uploadTask, "upload", 16384, NULL, 1, NULL, 1);
-            cmdSetResult("Starting upload...");
+            BaseType_t rc = xTaskCreatePinnedToCore(
+                uploadTask, "upload", TRANSFER_TASK_STACK, NULL, 1, NULL, 1
+            );
+            if (rc == pdPASS) {
+                cmdSetResult("Starting upload...");
+            } else {
+                cmdSetResult("Upload task create failed (%ld, heap=%d)", (long)rc, ESP.getFreeHeap());
+            }
         }
     } else if (strcmp(word, "d") == 0 || strcmp(word, "download") == 0) {
         if (!ssh_connected) {
@@ -816,32 +823,20 @@ void executeCommand(const char* cmd) {
         } else if (download_running) {
             cmdSetResult("Download in progress...");
         } else {
-            xTaskCreatePinnedToCore(downloadTask, "download", 16384, NULL, 1, NULL, 1);
-            cmdSetResult("Starting download...");
-        }
-    } else if (strcmp(word, "k") == 0 || strcmp(word, "keyboard") == 0) {
-        if (cmd_return_mode == MODE_KEYBOARD) {
-            AppMode back = keyboard_return_mode;
-            if (back == MODE_COMMAND || back == MODE_KEYBOARD) back = MODE_NOTEPAD;
-            cmd_return_mode = back;
-            app_mode = back;
-            cmdSetResult("Keyboard mode off");
-        } else {
-            keyboard_return_mode = cmd_return_mode;
-            cmd_return_mode = MODE_KEYBOARD;
-            app_mode = MODE_KEYBOARD;
-            if (btIsConnected()) cmdSetResult("Keyboard mode on");
-            else cmdSetResult("Keyboard mode on (BT waiting)");
+            BaseType_t rc = xTaskCreatePinnedToCore(
+                downloadTask, "download", TRANSFER_TASK_STACK, NULL, 1, NULL, 1
+            );
+            if (rc == pdPASS) {
+                cmdSetResult("Starting download...");
+            } else {
+                cmdSetResult("Download task create failed (%ld, heap=%d)", (long)rc, ESP.getFreeHeap());
+            }
         }
     }
     // --- Other commands ---
     else if (strcmp(word, "p") == 0 || strcmp(word, "paste") == 0) {
         if (text_len == 0) {
             cmdSetResult("Notepad empty");
-        } else if (cmd_return_mode == MODE_KEYBOARD) {
-            size_t sent = btTypeTextN(text_buf, (size_t)text_len, 0);
-            if (sent == 0) cmdSetResult("BT not connected");
-            else cmdSetResult("BT pasted %d/%d chars", (int)sent, text_len);
         } else if (!ssh_connected || !ssh_chan) {
             cmdSetResult("SSH not connected");
         } else {
@@ -861,23 +856,12 @@ void executeCommand(const char* cmd) {
         partial_count = 100;
         cmdSetResult("Full refresh queued");
     } else if (strcmp(word, "bt") == 0 || strcmp(word, "bluetooth") == 0) {
-        if (arg[0] == '\0' || strcmp(arg, "status") == 0) {
-            cmdClearResult();
-            cmdAddLine("BT:%s %s", btStatusShort(), btIsBonded() ? "bonded" : "unpaired");
-            cmdAddLine("Name:%s", config_bt_name);
-            cmdAddLine("Mode:HID keyboard");
-            if (btPeerAddress()[0] != '\0') {
-                cmdAddLine("Peer:%s", btPeerAddress());
-            }
-            if (config_bt_passkey >= 100000 && config_bt_passkey <= 999999) {
-                cmdAddLine("PIN:%06u", (unsigned)config_bt_passkey);
-            }
-        } else if (strncmp(arg, "send ", 5) == 0) {
-            size_t sent = btTypeText(arg + 5);
-            if (sent > 0) cmdSetResult("BT sent %d", (int)sent);
-            else cmdSetResult("BT not connected");
+        if (arg[0] != '\0') {
+            cmdSetResult("bt (toggle only)");
         } else {
-            cmdSetResult("bt status|send <txt>");
+            bool next = !btIsEnabled();
+            btSetEnabled(next);
+            cmdSetResult("BT %s (%s)", next ? "on" : "off", btStatusShort());
         }
     } else if (strcmp(word, "s") == 0 || strcmp(word, "status") == 0) {
         const char* ws = "off";
@@ -886,6 +870,8 @@ void executeCommand(const char* cmd) {
         else if (wifi_state == WIFI_FAILED) ws = "fail";
         cmdClearResult();
         cmdAddLine("WiFi:%s SSH:%s BT:%s", ws, ssh_connected ? "ok" : "off", btStatusShort());
+        cmdAddLine("BT name:%s", config_bt_name);
+        cmdAddLine("BT pair:%s", btIsBonded() ? "bonded" : "unpaired");
         if (wifi_last_fail_ssid[0] != '\0') {
             cmdAddLine("WiFi fail:%s", wifi_last_fail_ssid);
             cmdAddLine("Why:%s", wifi_last_fail_reason);
@@ -901,7 +887,7 @@ void executeCommand(const char* cmd) {
         cmdClearResult();
         cmdAddLine("(l)ist (e)dit (w)rite (n)ew");
         cmdAddLine("(r)m (u)pload (d)ownload");
-        cmdAddLine("(k)eyboard (p)aste dc (ws)/scan bt");
+        cmdAddLine("(p)aste dc (ws)/scan bt(toggle)");
         cmdAddLine("re(f)resh (s)tatus off (h)elp");
     } else {
         cmdSetResult("Unknown: %s (?=help)", word);
@@ -1074,8 +1060,7 @@ void renderCommandPrompt() {
         } else if (cmd_edit_picker_active) {
             display.print("[PICK] WASD nav ENTER open");
         } else {
-            if (cmd_return_mode == MODE_KEYBOARD) display.print("[CMD] k exit | p paste | MIC return");
-            else display.print("[CMD] ? help | MIC exit");
+            display.print("[CMD] ? help | MIC exit");
         }
     } while (display.nextPage());
 }

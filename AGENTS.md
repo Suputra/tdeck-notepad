@@ -4,7 +4,7 @@
 Run a closed hardware loop without manual keypresses:
 1. Flash debug firmware.
 2. Drive input over serial.
-3. Capture screen evidence via webcam.
+3. Capture screen evidence via camera feed (default: `http://10.0.44.199:4747/`).
 4. Decide pass/fail and iterate.
 
 ## Build Modes
@@ -28,14 +28,14 @@ Use this when you want a quick write+capture verification:
 
 ```bash
 pio run -e T-Deck-Pro-debug -t upload
-uv run scripts/agent_smoke.py --camera-device 1 --boot-wait 2
+uv run scripts/agent_smoke.py --boot-wait 2
 ```
 
 What `agent_smoke.py` does:
 1. Clears notepad.
 2. Types a marker string.
 3. Forces render and waits.
-4. Captures a webcam image.
+4. Captures a camera image from the default IP camera feed.
 5. Verifies serial `text_len` matches marker length.
 6. Verifies capture is not black/invalid.
 7. Prints `PASS` or `FAIL`.
@@ -46,7 +46,7 @@ Notes:
 - If custom marker text is provided, avoid `0` (current `TEXT` emulation limitation).
 
 ## Camera Setup
-If captures are black/blank or wrong camera is used:
+If using a local webcam and captures are black/blank or the wrong device is used:
 
 ```bash
 uv run scripts/probe_cameras.py --max-index 5
@@ -57,7 +57,7 @@ Pick an index with:
 - `frame=1`
 - non-trivial `mean/std` (not near zero)
 
-Then pass that index via `--camera-device`.
+Then pass that index via `--camera-source "<idx>"` (or deprecated `--camera-device`).
 
 ## Full Canonical Loop
 1. Flash debug firmware:
@@ -66,8 +66,9 @@ Then pass that index via `--camera-device`.
    `uv run scripts/tdeck_agent.py --boot-wait 2 "PING" "STATE"`
 3. Drive scenario over serial commands.
 4. Capture artifacts:
-   - image: `uv run scripts/capture_webcam.py --device <idx> --image artifacts/<name>.jpg`
-   - video: `uv run scripts/capture_webcam.py --device <idx> --video artifacts/<name>.mp4 --duration 8`
+   - image (default IP camera): `uv run scripts/capture_webcam.py --image artifacts/<name>.jpg`
+   - image (custom source): `uv run scripts/capture_webcam.py --source "<url-or-idx>" --image artifacts/<name>.jpg`
+   - video (custom source): `uv run scripts/capture_webcam.py --source "<url-or-idx>" --video artifacts/<name>.mp4 --duration 8`
 5. Evaluate:
    - no `AGENT ERR`
    - expected state transitions (`AGENT OK STATE ...`)
@@ -108,7 +109,7 @@ uv run scripts/tdeck_agent.py "PRESS MIC 2" "WAIT 300" "STATE"    # double-tap v
 
 ## Troubleshooting
 - `AGENT ERR`: treat as scenario failure; fix command or firmware behavior.
-- Camera opened but frame is black: use `scripts/probe_cameras.py`, switch `--camera-device`, increase `--warmup`.
+- Camera opened but frame is black: verify IP stream URL, or for local webcam use `scripts/probe_cameras.py` and switch `--camera-source`; increase `--warmup`.
 - `TEXT` fails due to active modifier mode: use explicit `KEY`/`KEYNAME` commands first.
 - `TEXT` fails on marker character `0`: use marker text without `0` or type `0` via key-level commands.
 - Need release validation: flash production env and rerun manual or non-agent checks.

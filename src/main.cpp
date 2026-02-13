@@ -69,7 +69,7 @@ Adafruit_TCA8418 keypad;
 
 // --- App Mode ---
 
-enum AppMode { MODE_NOTEPAD, MODE_TERMINAL, MODE_KEYBOARD, MODE_COMMAND };
+enum AppMode { MODE_NOTEPAD, MODE_TERMINAL, MODE_COMMAND };
 static volatile AppMode app_mode = MODE_NOTEPAD;
 
 // --- Editor State (shared between cores, protected by mutex) ---
@@ -79,7 +79,6 @@ static volatile AppMode app_mode = MODE_NOTEPAD;
 static char cmd_buf[CMD_BUF_LEN + 1];
 static int  cmd_len = 0;
 static AppMode cmd_return_mode = MODE_NOTEPAD;  // Mode to return to after command
-static AppMode keyboard_return_mode = MODE_NOTEPAD;
 
 // Multi-line command result (half screen)
 #define CMD_RESULT_LINES 13
@@ -818,7 +817,7 @@ void sdLoadConfig() {
     // # wifi — pairs of ssid/password (variable count)
     // # ssh — host, port, user, pass, [optional vpn-host]
     // # vpn — ENABLE, privkey, pubkey, psk, ip, endpoint, port, [optional dns]
-    // # bt  — optional BLE HID settings (name, [optional 6-digit pin])
+    // # bt  — optional BLE settings ([optional enable], name, [optional 6-digit pin])
     enum { SEC_WIFI, SEC_SSH, SEC_VPN, SEC_BT } section = SEC_WIFI;
     int field = 0;  // field index within current section
     bool wifi_expect_ssid = true;
@@ -881,8 +880,6 @@ void sdLoadConfig() {
             else if (line.indexOf("bt") >= 0)  {
                 section = SEC_BT;
                 field = 0;
-                // Section presence enables BLE.
-                config_bt_enabled = true;
             }
             continue;
         }
@@ -957,9 +954,20 @@ void sdLoadConfig() {
             field++;
         } else if (section == SEC_BT) {
             // Strict positional parsing:
-            // line 1: device name
-            // line 2 (optional): 6-digit passkey
+            // line 1 (optional): ENABLE/ON/TRUE/1
+            // line 2: device name
+            // line 3 (optional): 6-digit passkey
             if (field == 0) {
+                String lowered = line;
+                lowered.toLowerCase();
+                if (lowered == "enable" || lowered == "enabled" || lowered == "on" || lowered == "true" || lowered == "1") {
+                    config_bt_enabled = true;
+                    continue;
+                }
+                if (lowered == "disable" || lowered == "disabled" || lowered == "off" || lowered == "false" || lowered == "0") {
+                    config_bt_enabled = false;
+                    continue;
+                }
                 setBtName(line);
                 field = 1;
                 continue;
@@ -1378,8 +1386,6 @@ void loop() {
             needs_render = handleNotepadKeyPress(ev);
         } else if (mode == MODE_TERMINAL) {
             needs_render = handleTerminalKeyPress(ev);
-        } else if (mode == MODE_KEYBOARD) {
-            needs_render = handleKeyboardModeKeyPress(ev);
         } else if (mode == MODE_COMMAND) {
             needs_render = handleCommandKeyPress(ev);
         }
@@ -1391,8 +1397,6 @@ void loop() {
             if (cur == MODE_NOTEPAD) {
                 render_requested = true;
             } else if (cur == MODE_TERMINAL) {
-                term_render_requested = true;
-            } else if (cur == MODE_KEYBOARD) {
                 term_render_requested = true;
             } else if (cur == MODE_COMMAND) {
                 render_requested = true;

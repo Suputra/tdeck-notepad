@@ -222,7 +222,6 @@ void drawTerminalStatusBar() {
     const char* bt_suffix = "";
     if (btIsConnected()) bt_suffix = " +BT";
     else if (btIsEnabled()) bt_suffix = " bt";
-    bool keyboard_mode = (app_mode == MODE_KEYBOARD);
     // Build compact connection string
     if (ssh_connecting) {
         snprintf(status, sizeof(status), (vpnActive() ? "VPN SSH...%s" : "SSH...%s"), bt_suffix);
@@ -237,12 +236,6 @@ void drawTerminalStatusBar() {
     } else {
         snprintf(status, sizeof(status), btIsConnected() ? "BT %s" : "No net%s",
                  btIsConnected() ? btPeerAddress() : bt_suffix);
-    }
-    if (keyboard_mode) {
-        char kbd_status[60];
-        snprintf(kbd_status, sizeof(kbd_status), "KBD %s", status);
-        strncpy(status, kbd_status, sizeof(status) - 1);
-        status[sizeof(status) - 1] = '\0';
     }
     display.print(status);
     // Battery on right side
@@ -395,7 +388,7 @@ void displayTask(void* param) {
             last_mode = cur_mode;
             partial_count = 0;
             display_idle = false;
-            if (cur_mode == MODE_TERMINAL || cur_mode == MODE_KEYBOARD) {
+            if (cur_mode == MODE_TERMINAL) {
                 xSemaphoreTake(state_mutex, portMAX_DELAY);
                 snapshotTerminalState();
                 xSemaphoreGive(state_mutex);
@@ -415,8 +408,8 @@ void displayTask(void* param) {
             continue;
         }
 
-        // --- Terminal / keyboard mode ---
-        if (cur_mode == MODE_TERMINAL || cur_mode == MODE_KEYBOARD) {
+        // --- Terminal mode ---
+        if (cur_mode == MODE_TERMINAL) {
             if (term_render_requested || render_requested) {
                 term_render_requested = false;
                 render_requested = false;

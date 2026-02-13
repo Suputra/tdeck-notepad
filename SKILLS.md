@@ -44,7 +44,7 @@ Use as the default end-to-end verification of write+render+capture.
 
 Command:
 ```bash
-uv run scripts/agent_smoke.py --camera-device <idx> --boot-wait 2
+uv run scripts/agent_smoke.py --boot-wait 2
 ```
 
 Pass criteria:
@@ -54,6 +54,7 @@ Pass criteria:
 
 Constraint:
 - Custom `--marker` should avoid character `0` for now.
+- Default camera source is `http://10.0.44.199:4747/`; override with `--camera-source`.
 
 ## `scenario-drive`
 Use to emulate device input and mode transitions without touching hardware keys.
@@ -88,6 +89,7 @@ Commands:
 ```bash
 uv run scripts/capture_webcam.py --image artifacts/frame.jpg
 uv run scripts/capture_webcam.py --video artifacts/run.mp4 --duration 10
+uv run scripts/capture_webcam.py --source "0" --image artifacts/usb-cam.jpg
 ```
 
 Pass criteria:

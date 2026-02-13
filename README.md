@@ -1,6 +1,6 @@
 # T-Deck Pro Notepad
 
-Firmware for the LilyGo T-Deck Pro — a pocket notepad with SSH terminal, file manager, WireGuard VPN, and BLE HID keyboard phone pairing.
+Firmware for the LilyGo T-Deck Pro — a pocket notepad with SSH terminal, file manager, WireGuard VPN, and optional barebones BLE peripheral pairing.
 
 ## Build & Flash
 
@@ -40,7 +40,7 @@ uv run scripts/tdeck_agent.py "MIC SINGLE" "WAIT 500" "STATE"
 uv run scripts/tdeck_agent.py "MIC DOUBLE" "WAIT 300" "STATE"
 ```
 
-You can also capture screen evidence from a webcam:
+You can also capture screen evidence from the default IP camera feed (`http://10.0.44.199:4747/`):
 
 ```bash
 uv run scripts/capture_webcam.py --image artifacts/screen.jpg
@@ -49,10 +49,17 @@ uv run scripts/capture_webcam.py --image artifacts/screen.jpg
 Recommended end-to-end smoke command (write + render + capture + checks):
 
 ```bash
-uv run scripts/agent_smoke.py --camera-device 1 --boot-wait 2
+uv run scripts/agent_smoke.py --boot-wait 2
 ```
 
-If camera index is wrong or captures are black:
+To use a different camera source:
+
+```bash
+uv run scripts/agent_smoke.py --camera-source "http://<ip>:4747/" --boot-wait 2
+uv run scripts/capture_webcam.py --source "0" --image artifacts/usb-webcam.jpg
+```
+
+If a local webcam index is wrong or captures are black:
 
 ```bash
 uv run scripts/probe_cameras.py --max-index 5
@@ -97,6 +104,8 @@ password
 10.0.0.1
 
 # bt (optional)
+# optional auto-enable at boot; otherwise BT stays off until `bt on`
+enable
 TDeck-Pro
 # optional 6-digit static passkey for secure pairing
 123456
@@ -104,13 +113,13 @@ TDeck-Pro
 
 Open WiFi entries: put only the SSID and leave the password line blank (or end the WiFi section right after the SSID).
 
-If `# bt` is enabled, the device advertises as a BLE HID keyboard and keeps advertising whenever disconnected. After first bonding/pairing with your phone, iOS can reconnect using standard keyboard behavior.
 `# bt` parsing is positional:
-1. Device name
-2. Optional 6-digit passkey
+1. Optional `enable`/`on`/`true`/`1` to auto-enable Bluetooth at boot
+2. Device name
+3. Optional 6-digit passkey
 
 If `# bt` section is missing, BLE stays disabled.
-HID access requires encryption, so iOS should prompt to pair/bond on first access.
+If BT is enabled, the device advertises as a generic BLE peripheral (not a keyboard), so phones keep their on-screen keyboard.
 
 ## Usage
 
@@ -128,14 +137,13 @@ Double-tap **MIC** to switch to terminal mode. The device connects WiFi, tries S
 
 - **Alt** — acts as ctrl - alt + space -> esc
 
-### Keyboard Mode (BLE HID)
+### Bluetooth (bare mode)
 
-Single-tap **MIC** to open command mode, run `k` to enter keyboard mode, then keypresses are sent to the paired phone over BLE HID.
+Bluetooth is runtime-toggleable from the command prompt with a single command:
 
-- **MIC** single tap: open command prompt
-- `k` again from command prompt: exit keyboard mode
-- **Alt** acts as Command modifier for phone shortcuts
-- `p` in command mode while returning to keyboard mode pastes the current notepad buffer to the phone
+- `bt` toggles Bluetooth on/off
+
+To reduce unwanted phone wakes, advertising is not kept alive indefinitely.
 
 ### Command Processor
 
@@ -150,13 +158,12 @@ Single-tap **MIC** from either mode to open the command prompt (bottom half of s
 | `r` / `rm <file>` | Delete a file |
 | `u` / `upload` | SCP all SD files to `~/tdeck` on SSH host |
 | `d` / `download` | SCP `~/tdeck` files to SD card |
-| `k` / `keyboard` | Toggle BLE keyboard mode on/off |
-| `p` / `paste` | Paste notepad to SSH, or to BLE phone when returning to keyboard mode |
+| `p` / `paste` | Paste notepad to SSH |
 | `dc` | Disconnect SSH |
 | `ws` / `scan` | Scan WiFi and retry known APs manually |
-| `bt` / `bluetooth` | BLE status (`bt status`), send typed text (`bt send <txt>`) |
+| `bt` / `bluetooth` | Toggle Bluetooth on/off |
 | `f` / `refresh` | Force full e-ink refresh |
-| `s` / `status` | Show WiFi/SSH/VPN/battery status |
+| `s` / `status` | Show WiFi/SSH/VPN/battery status (includes BT name/pair/peer) |
 | `?` / `h` / `help` | Show help |
 
 ## Architecture
@@ -164,7 +171,7 @@ Single-tap **MIC** from either mode to open the command prompt (bottom half of s
 Firmware entry point remains `src/main.cpp` (setup/loop and global state), while major firmware components are split into flat module headers in `src/`:
 
 - `src/network_module.hpp` (WiFi, SSH, VPN connectivity)
-- `src/bluetooth_module.hpp` (BLE HID keyboard, pairing/bonding, auto-advertise, keepalive typing)
+- `src/bluetooth_module.hpp` (barebones BLE peripheral, pairing/bonding, runtime toggle)
 - `src/screen_module.hpp` (display rendering/task logic)
 - `src/keyboard_module.hpp` (keyboard input + mode handlers)
 - `src/cli_module.hpp` (command parsing, SCP helpers, poweroff flow)
