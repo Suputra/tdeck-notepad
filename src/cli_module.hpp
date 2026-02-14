@@ -1730,7 +1730,10 @@ void renderCommandPrompt() {
         int bar_y = SCREEN_H - STATUS_H;
         display.fillRect(0, bar_y, SCREEN_W, STATUS_H, GxEPD_BLACK);
         display.setTextColor(GxEPD_WHITE);
-        display.setCursor(2, bar_y + 1);
+        display.setFont(NULL);
+        char status_left[72];
+        status_left[0] = '\0';
+        bool show_runtime = false;
         if (upload_running) {
             uint32_t done = upload_bytes_done;
             uint32_t total = upload_bytes_total;
@@ -1746,7 +1749,7 @@ void renderCommandPrompt() {
             snprintf(ul, sizeof(ul), "U %d/%d %s/%s %s/s",
                      (int)upload_done_count, (int)upload_total_count,
                      done_s, total_s, rate_s);
-            display.print(ul);
+            snprintf(status_left, sizeof(status_left), "%s", ul);
         } else if (download_running) {
             uint32_t done = download_bytes_done;
             uint32_t total = download_bytes_total;
@@ -1762,13 +1765,21 @@ void renderCommandPrompt() {
             snprintf(dl, sizeof(dl), "D %d/%d %s/%s %s/s",
                      (int)download_done_count, (int)download_total_count,
                      done_s, total_s, rate_s);
-            display.print(dl);
+            snprintf(status_left, sizeof(status_left), "%s", dl);
         } else if (shortcut_running) {
-            display.print("[RUN] shortcut...");
+            snprintf(status_left, sizeof(status_left), "[RUN] shortcut...");
         } else if (cmd_edit_picker_active) {
-            display.print("[PICK] W/S move A/D page Enter");
+            snprintf(status_left, sizeof(status_left), "[PICK] W/S move A/D page Enter");
         } else {
-            display.print("[CMD] h/help | MIC exit");
+            status_left[0] = '\0';
+            show_runtime = true;
         }
+
+        char status_right[48];
+        status_right[0] = '\0';
+        if (show_runtime) {
+            buildStatusRight(status_right, sizeof(status_right), true);
+        }
+        drawStatusBarLine(status_left, status_right, bar_y);
     } while (display.nextPage());
 }

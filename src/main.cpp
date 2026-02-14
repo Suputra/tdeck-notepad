@@ -68,6 +68,15 @@ static bool vpnActive() { return vpn_connected && wg.is_initialized(); }
 void connectMsg(const char* fmt, ...);
 void powerOff();
 static int partial_count = 0;
+static volatile uint32_t perf_window_start_ms = 0;
+static volatile uint32_t perf_heap_min5_kb = 0;
+static volatile uint32_t perf_render_max5_ms = 0;
+static volatile uint32_t perf_loop_max5_ms = 0;
+static constexpr uint32_t PERF_WINDOW_MS = 5000U;
+static void perfRecordRenderMs(uint32_t render_ms);
+static void perfLoopTick();
+static void buildPerfStatusCompact(char* out, size_t out_len);
+static void perfMaybeRollWindow(uint32_t now_ms);
 
 // --- SD Card State ---
 static bool sd_mounted = false;
@@ -376,6 +385,59 @@ LayoutInfo computeLayoutFrom(const char* buf, int len, int cpos) {
     }
     info.total_lines = line + 1;
     return info;
+}
+
+static void perfRecordRenderMs(uint32_t render_ms) {
+    uint32_t now = millis();
+    perfMaybeRollWindow(now);
+    if (render_ms > perf_render_max5_ms) {
+        perf_render_max5_ms = render_ms;
+    }
+}
+
+static void perfMaybeRollWindow(uint32_t now_ms) {
+    uint32_t start_ms = perf_window_start_ms;
+    if (start_ms == 0 || now_ms - start_ms >= PERF_WINDOW_MS) {
+        perf_window_start_ms = now_ms;
+        perf_render_max5_ms = 0;
+        perf_loop_max5_ms = 0;
+        perf_heap_min5_kb = ESP.getFreeHeap() / 1024U;
+    }
+}
+
+static void perfLoopTick() {
+    static unsigned long last_loop_tick_ms = 0;
+    static unsigned long last_heap_sample_ms = 0;
+    unsigned long now = millis();
+    perfMaybeRollWindow(now);
+
+    if (last_loop_tick_ms != 0) {
+        uint32_t loop_dt = now - last_loop_tick_ms;
+        if (loop_dt > perf_loop_max5_ms) {
+            perf_loop_max5_ms = loop_dt;
+        }
+    }
+    last_loop_tick_ms = now;
+
+    if (perf_heap_min5_kb == 0 || now - last_heap_sample_ms >= 200) {
+        uint32_t free_kb = ESP.getFreeHeap() / 1024U;
+        if (perf_heap_min5_kb == 0 || free_kb < perf_heap_min5_kb) {
+            perf_heap_min5_kb = free_kb;
+        }
+        last_heap_sample_ms = now;
+    }
+}
+
+static void buildPerfStatusCompact(char* out, size_t out_len) {
+    if (!out || out_len == 0) return;
+    perfMaybeRollWindow(millis());
+    uint32_t min_heap_kb = perf_heap_min5_kb;
+    if (min_heap_kb == 0) min_heap_kb = ESP.getFreeHeap() / 1024U;
+
+    snprintf(out, out_len, "H%lu R%lu L%lu",
+             (unsigned long)min_heap_kb,
+             (unsigned long)perf_render_max5_ms,
+             (unsigned long)perf_loop_max5_ms);
 }
 
 // --- Terminal Buffer Operations ---
@@ -1771,6 +1833,7 @@ void setup() {
     timeSyncSetTimeZone(config_time_tz);
     gnssInit();
     btInit();
+    updateBattery();  // Seed battery_pct before the first status bar render.
 
     // Init terminal buffer
     terminalClear();
@@ -1797,6 +1860,7 @@ void setup() {
 // Core 1: keyboard polling — never blocks on display
 void loop() {
     agentPollSerial();
+    perfLoopTick();
     gnssPoll();
 
     // Press BOOT to request power-off (same behavior as the "off" command).
@@ -1831,7 +1895,13 @@ void loop() {
     static unsigned long last_batt_check = 0;
     if (millis() - last_batt_check > 30000) {
         last_batt_check = millis();
+        int prev_battery_pct = battery_pct;
         updateBattery();
+        if (battery_pct != prev_battery_pct) {
+            AppMode cur = app_mode;
+            if (cur == MODE_TERMINAL) term_render_requested = true;
+            else render_requested = true;
+        }
     }
 
     // BLE maintenance: auto-advertise and reconnect handling.

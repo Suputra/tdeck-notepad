@@ -114,13 +114,69 @@ void updateBattery() {
 static unsigned long mic_last_press = 0;
 #define MIC_CMD_TAP_DELAY_MS 350
 
+static void buildStatusRight(char* out, size_t out_len, bool include_battery) {
+    if (!out || out_len == 0) return;
+    char perf[40];
+    buildPerfStatusCompact(perf, sizeof(perf));
+    if (include_battery && battery_pct >= 0) {
+        snprintf(out, out_len, "%s %d%%", perf, battery_pct);
+    } else {
+        snprintf(out, out_len, "%s", perf);
+    }
+}
+
+static void drawStatusBarLine(const char* left, const char* right, int bar_y) {
+    constexpr int total_cols = SCREEN_W / CHAR_W;
+    int right_cols = (right && right[0]) ? (int)strlen(right) : 0;
+    if (right_cols > total_cols - 1) right_cols = total_cols - 1;
+    int left_max_cols = total_cols - right_cols - (right_cols > 0 ? 1 : 0);
+    if (left_max_cols < 0) left_max_cols = 0;
+
+    char left_buf[80];
+    left_buf[0] = '\0';
+    if (left && left_max_cols > 0) {
+        int left_len = (int)strlen(left);
+        if (left_len <= left_max_cols) {
+            int copy_len = left_len;
+            if (copy_len > (int)sizeof(left_buf) - 1) copy_len = (int)sizeof(left_buf) - 1;
+            memcpy(left_buf, left, copy_len);
+            left_buf[copy_len] = '\0';
+        } else if (left_max_cols >= 2) {
+            int copy_len = left_max_cols - 1;
+            if (copy_len > (int)sizeof(left_buf) - 2) copy_len = (int)sizeof(left_buf) - 2;
+            memcpy(left_buf, left, copy_len);
+            left_buf[copy_len] = '~';
+            left_buf[copy_len + 1] = '\0';
+        } else {
+            left_buf[0] = '~';
+            left_buf[1] = '\0';
+        }
+    }
+
+    display.setCursor(2, bar_y + 1);
+    if (left_buf[0] != '\0') {
+        display.print(left_buf);
+    }
+
+    if (right_cols > 0 && right) {
+        char right_buf[48];
+        int copy_len = right_cols;
+        if (copy_len > (int)sizeof(right_buf) - 1) copy_len = (int)sizeof(right_buf) - 1;
+        memcpy(right_buf, right, copy_len);
+        right_buf[copy_len] = '\0';
+        int rx = SCREEN_W - copy_len * CHAR_W - 2;
+        if (rx < 2) rx = 2;
+        display.setCursor(rx, bar_y + 1);
+        display.print(right_buf);
+    }
+}
+
 void drawStatusBar(const LayoutInfo& info) {
     int bar_y = SCREEN_H - STATUS_H;
     display.fillRect(0, bar_y, SCREEN_W, STATUS_H, GxEPD_BLACK);
     display.setTextColor(GxEPD_WHITE);
     display.setFont(NULL);
-    display.setCursor(2, bar_y + 1);
-    char status[60];
+    char status[72];
     char mods[16] = "";
     if (snap_shift) strcat(mods, "SH ");
     if (snap_sym)   strcat(mods, "SY ");
@@ -135,15 +191,9 @@ void drawStatusBar(const LayoutInfo& info) {
              fname, file_modified ? "*" : "",
              info.cursor_line + 1, info.cursor_col + 1,
              mods);
-    // Append battery on right side if known
-    display.print(status);
-    if (battery_pct >= 0) {
-        char batt[8];
-        snprintf(batt, sizeof(batt), "%d%%", battery_pct);
-        int bx = SCREEN_W - strlen(batt) * CHAR_W - 2;
-        display.setCursor(bx, bar_y + 1);
-        display.print(batt);
-    }
+    char right[48];
+    buildStatusRight(right, sizeof(right), true);
+    drawStatusBarLine(status, right, bar_y);
 }
 
 // --- Terminal Rendering ---
@@ -215,9 +265,8 @@ void drawTerminalStatusBar() {
     display.fillRect(0, bar_y, SCREEN_W, STATUS_H, GxEPD_BLACK);
     display.setTextColor(GxEPD_WHITE);
     display.setFont(NULL);
-    display.setCursor(2, bar_y + 1);
 
-    char status[60];
+    char status[72];
     const char* bt_suffix = "";
     if (btIsConnected()) bt_suffix = " +BT";
     else if (btIsEnabled()) bt_suffix = " bt";
@@ -236,15 +285,9 @@ void drawTerminalStatusBar() {
         snprintf(status, sizeof(status), btIsConnected() ? "BT %s" : "No net%s",
                  btIsConnected() ? btPeerAddress() : bt_suffix);
     }
-    display.print(status);
-    // Battery on right side
-    if (battery_pct >= 0) {
-        char batt[8];
-        snprintf(batt, sizeof(batt), "%d%%", battery_pct);
-        int bx = SCREEN_W - strlen(batt) * CHAR_W - 2;
-        display.setCursor(bx, bar_y + 1);
-        display.print(batt);
-    }
+    char right[48];
+    buildStatusRight(right, sizeof(right), true);
+    drawStatusBarLine(status, right, bar_y);
 }
 
 void renderConnectScreen() {
@@ -364,7 +407,9 @@ void displayTask(void* param) {
     xSemaphoreGive(state_mutex);
     display_idle = false;
     prev_layout = computeLayoutFrom(snap_buf, snap_len, snap_cursor);
+    uint32_t render_started = millis();
     refreshFullClean(prev_layout);
+    perfRecordRenderMs(millis() - render_started);
     display_idle = true;
 
     AppMode last_mode = MODE_NOTEPAD;
@@ -389,15 +434,21 @@ void displayTask(void* param) {
                 xSemaphoreTake(state_mutex, portMAX_DELAY);
                 snapshotTerminalState();
                 xSemaphoreGive(state_mutex);
+                uint32_t render_started = millis();
                 renderTerminalFullClean();
+                perfRecordRenderMs(millis() - render_started);
             } else if (cur_mode == MODE_COMMAND) {
+                uint32_t render_started = millis();
                 renderCommandPrompt();
+                perfRecordRenderMs(millis() - render_started);
             } else {
                 xSemaphoreTake(state_mutex, portMAX_DELAY);
                 snapshotState();
                 xSemaphoreGive(state_mutex);
                 prev_layout = computeLayoutFrom(snap_buf, snap_len, snap_cursor);
+                uint32_t render_started = millis();
                 refreshFullClean(prev_layout);
+                perfRecordRenderMs(millis() - render_started);
             }
             display_idle = true;
             render_requested = false;
@@ -412,6 +463,7 @@ void displayTask(void* param) {
                 render_requested = false;
 
                 display_idle = false;
+                uint32_t render_started = millis();
                 if (cur_mode == MODE_TERMINAL && connect_status_count > 0) {
                     renderConnectScreen();
                 } else {
@@ -425,6 +477,7 @@ void displayTask(void* param) {
                         renderTerminal();
                     }
                 }
+                perfRecordRenderMs(millis() - render_started);
                 display_idle = true;
             }
             vTaskDelay(1);
@@ -436,7 +489,9 @@ void displayTask(void* param) {
             if (render_requested) {
                 render_requested = false;
                 display_idle = false;
+                uint32_t render_started = millis();
                 renderCommandPrompt();
+                perfRecordRenderMs(millis() - render_started);
                 display_idle = true;
             }
             vTaskDelay(1);
@@ -466,7 +521,9 @@ void displayTask(void* param) {
 
         display_idle = false;
         if (partial_count >= 20) {
+            uint32_t render_started = millis();
             refreshFullClean(cur);
+            perfRecordRenderMs(millis() - render_started);
             display_idle = true;
             prev_layout = cur;
             continue;
@@ -474,7 +531,9 @@ void displayTask(void* param) {
 
         int line_delta = abs(cur.cursor_line - prev_layout.cursor_line);
         if (line_delta > ROWS_PER_SCREEN) {
+            uint32_t render_started = millis();
             refreshAllPartial(cur);
+            perfRecordRenderMs(millis() - render_started);
             display_idle = true;
             prev_layout = cur;
             continue;
@@ -486,12 +545,16 @@ void displayTask(void* param) {
         if (cur.total_lines != prev_layout.total_lines) {
             int from = min(old_sl, new_sl);
             if (from < 0) from = 0;
+            uint32_t render_started = millis();
             refreshLines(from, ROWS_PER_SCREEN - 1, cur);
+            perfRecordRenderMs(millis() - render_started);
         } else {
             int min_l = min(old_sl, new_sl);
             int max_l = max(old_sl, new_sl);
             if (min_l < 0) min_l = 0;
+            uint32_t render_started = millis();
             refreshLines(min_l, max_l, cur);
+            perfRecordRenderMs(millis() - render_started);
         }
         display_idle = true;
 
