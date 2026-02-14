@@ -16,10 +16,21 @@ static volatile uint32_t upload_started_ms = 0;
 static volatile uint32_t download_started_ms = 0;
 static volatile uint32_t upload_last_ui_ms = 0;
 static volatile uint32_t download_last_ui_ms = 0;
+static volatile bool shortcut_running = false;
 
 static constexpr size_t TRANSFER_CHUNK_SIZE = 256;
 static constexpr size_t TRANSFER_LINE_MAX = 192;
 static constexpr uint32_t TRANSFER_TASK_STACK = 8192;
+static constexpr uint32_t TRANSFER_SSH_WAIT_MS = 45000;
+static constexpr size_t SHORTCUT_PATH_MAX = 96;
+static constexpr size_t SHORTCUT_NAME_MAX = 64;
+static constexpr int SHORTCUT_MAX_STEPS = 24;
+static constexpr size_t SHORTCUT_STEP_MAX = 160;
+static constexpr uint32_t SHORTCUT_TASK_STACK = 8192;
+static constexpr uint32_t SHORTCUT_WAIT_TIMEOUT_MS = 300000;
+
+static char shortcut_pending_path[SHORTCUT_PATH_MAX] = "";
+static char shortcut_pending_name[SHORTCUT_NAME_MAX] = "";
 
 uint32_t satAddU32(uint32_t a, uint32_t b) {
     if (UINT32_MAX - a < b) return UINT32_MAX;
@@ -126,6 +137,31 @@ int sshCloseExecChannel(ssh_channel channel) {
     int exit_status = ssh_channel_get_exit_status(channel);
     ssh_channel_free(channel);
     return exit_status;
+}
+
+bool ensureSshForTransfer(const char* action_label) {
+    if (ssh_connected && ssh_sess) return true;
+
+    if (!ssh_connecting) {
+        sshConnectAsync();
+    }
+
+    cmdSetResult("%s: connecting SSH...", action_label);
+    render_requested = true;
+
+    uint32_t start_ms = millis();
+    while (!ssh_connected) {
+        if ((millis() - start_ms) >= TRANSFER_SSH_WAIT_MS) break;
+        if (!ssh_connecting) break;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    if (!ssh_connected || !ssh_sess) {
+        cmdSetResult("%s failed: SSH connect failed", action_label);
+        render_requested = true;
+        return false;
+    }
+    return true;
 }
 
 bool uploadStreamFile(ssh_channel channel, const char* file_name) {
@@ -276,6 +312,12 @@ void uploadTask(void* param) {
     upload_started_ms = millis();
     upload_last_ui_ms = upload_started_ms;
 
+    if (!ensureSshForTransfer("Upload")) {
+        upload_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
     // List flat files at root
     int n = listDirectory("/");
     upload_total_count = 0;
@@ -347,6 +389,12 @@ void downloadTask(void* param) {
     download_started_ms = millis();
     download_last_ui_ms = download_started_ms;
 
+    if (!ensureSshForTransfer("Download")) {
+        download_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
     ssh_channel channel = NULL;
     if (!sshOpenExecChannel(REMOTE_DOWNLOAD_STREAM_CMD, &channel)) {
         cmdSetResult("Download start failed: %s", ssh_get_error(ssh_sess));
@@ -400,6 +448,416 @@ void downloadTask(void* param) {
     render_requested = true;
     download_running = false;
     vTaskDelete(NULL);
+}
+
+bool startUploadTransfer() {
+    if (download_running) {
+        cmdSetResult("Transfer in progress...");
+        return false;
+    }
+    if (upload_running) {
+        cmdSetResult("Upload in progress...");
+        return false;
+    }
+
+    // Mark running before scheduling task so shortcut "wait upload" cannot race.
+    upload_running = true;
+    BaseType_t rc = xTaskCreatePinnedToCore(
+        uploadTask, "upload", TRANSFER_TASK_STACK, NULL, 1, NULL, 1
+    );
+    if (rc == pdPASS) {
+        cmdSetResult("Starting upload...");
+        return true;
+    }
+
+    upload_running = false;
+    cmdSetResult("Upload task create failed (%ld, heap=%d)", (long)rc, ESP.getFreeHeap());
+    return false;
+}
+
+bool startDownloadTransfer() {
+    if (upload_running) {
+        cmdSetResult("Transfer in progress...");
+        return false;
+    }
+    if (download_running) {
+        cmdSetResult("Download in progress...");
+        return false;
+    }
+
+    // Mark running before scheduling task so shortcut "wait download" cannot race.
+    download_running = true;
+    BaseType_t rc = xTaskCreatePinnedToCore(
+        downloadTask, "download", TRANSFER_TASK_STACK, NULL, 1, NULL, 1
+    );
+    if (rc == pdPASS) {
+        cmdSetResult("Starting download...");
+        return true;
+    }
+
+    download_running = false;
+    cmdSetResult("Download task create failed (%ld, heap=%d)", (long)rc, ESP.getFreeHeap());
+    return false;
+}
+
+bool executeCommand(const char* cmd);
+
+bool isShortcutWhitespace(char c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+void trimShortcutLine(char* line) {
+    if (!line) return;
+    size_t len = strlen(line);
+    while (len > 0 && isShortcutWhitespace(line[len - 1])) {
+        line[len - 1] = '\0';
+        len--;
+    }
+
+    size_t start = 0;
+    while (line[start] && isShortcutWhitespace(line[start])) start++;
+    if (start > 0) {
+        memmove(line, line + start, strlen(line + start) + 1);
+    }
+}
+
+bool isShortcutName(const char* name) {
+    if (!name) return false;
+    size_t len = strlen(name);
+    if (len < 2) return false;
+    if (name[len - 2] != '.') return false;
+    char ext = name[len - 1];
+    return ext == 'x' || ext == 'X';
+}
+
+bool fileExistsRegular(const char* path) {
+    if (!path || path[0] == '\0') return false;
+    sdAcquire();
+    File f = SD.open(path, FILE_READ);
+    bool ok = f && !f.isDirectory();
+    if (f) f.close();
+    sdRelease();
+    return ok;
+}
+
+bool resolveShortcutPath(const char* raw_name,
+                         char* out_path, size_t out_path_len,
+                         char* out_name, size_t out_name_len) {
+    if (!raw_name || !out_path || !out_name || out_path_len < 2 || out_name_len < 3) return false;
+
+    const char* name = raw_name;
+    while (*name == ' ') name++;
+    while (*name == '/') name++;
+    if (*name == '\0') return false;
+    if (!isSafeTransferName(name)) return false;
+
+    char normalized[SHORTCUT_NAME_MAX];
+    if (isShortcutName(name)) {
+        strncpy(normalized, name, sizeof(normalized) - 1);
+        normalized[sizeof(normalized) - 1] = '\0';
+    } else {
+        int n = snprintf(normalized, sizeof(normalized), "%s.x", name);
+        if (n <= 0 || n >= (int)sizeof(normalized)) return false;
+    }
+
+    int pn = snprintf(out_path, out_path_len, "/%s", normalized);
+    if (pn <= 0 || pn >= (int)out_path_len) return false;
+    if (!fileExistsRegular(out_path)) return false;
+
+    strncpy(out_name, normalized, out_name_len - 1);
+    out_name[out_name_len - 1] = '\0';
+    return true;
+}
+
+bool loadShortcutSteps(const char* path,
+                       char steps[SHORTCUT_MAX_STEPS][SHORTCUT_STEP_MAX],
+                       int* out_count,
+                       int* out_error_line) {
+    if (!path || !steps || !out_count || !out_error_line) return false;
+    *out_count = 0;
+    *out_error_line = 0;
+
+    sdAcquire();
+    File f = SD.open(path, FILE_READ);
+    if (!f || f.isDirectory()) {
+        if (f) f.close();
+        sdRelease();
+        return false;
+    }
+
+    int line_no = 0;
+    bool ok = true;
+    while (f.available()) {
+        char raw[SHORTCUT_STEP_MAX];
+        line_no++;
+        int n = f.readBytesUntil('\n', raw, sizeof(raw) - 1);
+        raw[n] = '\0';
+
+        bool overflow = false;
+        if (n == (int)sizeof(raw) - 1) {
+            int peeked = f.peek();
+            if (peeked >= 0 && peeked != '\n' && peeked != '\r') {
+                overflow = true;
+                while (f.available()) {
+                    int ch = f.read();
+                    if (ch == '\n') break;
+                }
+            }
+        }
+
+        trimShortcutLine(raw);
+        if (raw[0] == '\0' || raw[0] == '#') continue;
+
+        if (overflow) {
+            ok = false;
+            *out_error_line = line_no;
+            break;
+        }
+        if (*out_count >= SHORTCUT_MAX_STEPS) {
+            ok = false;
+            *out_error_line = line_no;
+            break;
+        }
+
+        strncpy(steps[*out_count], raw, SHORTCUT_STEP_MAX - 1);
+        steps[*out_count][SHORTCUT_STEP_MAX - 1] = '\0';
+        (*out_count)++;
+    }
+
+    f.close();
+    sdRelease();
+    return ok;
+}
+
+bool shortcutWaitForFlagClear(volatile bool* flag, const char* label) {
+    if (!flag || !label) return false;
+    uint32_t start = millis();
+    while (*flag) {
+        if ((uint32_t)(millis() - start) >= SHORTCUT_WAIT_TIMEOUT_MS) {
+            cmdSetResult("Shortcut timeout: %s", label);
+            render_requested = true;
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    return true;
+}
+
+bool runShortcutRemoteCommand(const char* remote_cmd) {
+    if (!remote_cmd || remote_cmd[0] == '\0') {
+        cmdSetResult("Shortcut: remote <cmd>");
+        return false;
+    }
+    if (!ensureSshForTransfer("Remote")) return false;
+
+    ssh_channel channel = NULL;
+    if (!sshOpenExecChannel("/bin/sh -s", &channel)) {
+        // Recover from stale/broken SSH sessions (common after long transfers).
+        sshDisconnect();
+        if (!ensureSshForTransfer("Remote retry") || !sshOpenExecChannel("/bin/sh -s", &channel)) {
+            cmdSetResult("Remote start failed: %s", ssh_get_error(ssh_sess));
+            return false;
+        }
+    }
+
+    char script[SHORTCUT_STEP_MAX + 96];
+    int script_len = snprintf(
+        script, sizeof(script),
+        "set +e\n"
+        "%s\n"
+        "rc=$?\n"
+        "printf \"__TDECK_RC__%%d\\n\" \"$rc\"\n",
+        remote_cmd
+    );
+    if (script_len <= 0 || script_len >= (int)sizeof(script)) {
+        sshCloseExecChannel(channel);
+        cmdSetResult("Remote cmd too long");
+        return false;
+    }
+    if (!sshWriteAll(channel, (const uint8_t*)script, (size_t)script_len)) {
+        sshCloseExecChannel(channel);
+        cmdSetResult("Remote write failed");
+        return false;
+    }
+    ssh_channel_send_eof(channel);
+
+    bool got_marker = false;
+    int remote_rc = -1;
+    for (int i = 0; i < 32; i++) {
+        char line[TRANSFER_LINE_MAX];
+        if (!sshReadLine(channel, line, sizeof(line))) break;
+        if (strncmp(line, "__TDECK_RC__", 11) == 0) {
+            remote_rc = atoi(line + 11);
+            got_marker = true;
+            break;
+        }
+    }
+    int exit_status = sshCloseExecChannel(channel);
+    if (!got_marker) {
+        if (exit_status == 0) {
+            cmdSetResult("Remote OK");
+            return true;
+        }
+        if (exit_status > 0) {
+            cmdSetResult("Remote failed (%d)", exit_status);
+            return false;
+        }
+        cmdSetResult("Remote no status");
+        return false;
+    }
+    if (remote_rc != 0) {
+        cmdSetResult("Remote failed (%d)", remote_rc);
+        return false;
+    }
+    if (exit_status != 0) {
+        cmdSetResult("Remote shell failed (%d)", exit_status);
+        return false;
+    }
+
+    cmdSetResult("Remote OK");
+    return true;
+}
+
+bool executeShortcutStep(const char* raw_step) {
+    if (!raw_step || raw_step[0] == '\0') return true;
+
+    char step[SHORTCUT_STEP_MAX];
+    strncpy(step, raw_step, sizeof(step) - 1);
+    step[sizeof(step) - 1] = '\0';
+    trimShortcutLine(step);
+    if (step[0] == '\0' || step[0] == '#') return true;
+
+    char* p = step;
+    while (*p && !isShortcutWhitespace(*p)) p++;
+
+    char* rest = p;
+    if (*rest != '\0') {
+        *rest++ = '\0';
+        while (*rest && isShortcutWhitespace(*rest)) rest++;
+    }
+
+    if (strcasecmp(step, "upload") == 0 || strcasecmp(step, "u") == 0) {
+        return startUploadTransfer();
+    }
+    if (strcasecmp(step, "download") == 0 || strcasecmp(step, "d") == 0) {
+        return startDownloadTransfer();
+    }
+    if (strcasecmp(step, "wait") == 0) {
+        if (!rest || rest[0] == '\0') {
+            cmdSetResult("Shortcut: wait <ms|upload|download>");
+            return false;
+        }
+        if (strcasecmp(rest, "upload") == 0) {
+            return shortcutWaitForFlagClear(&upload_running, "upload");
+        }
+        if (strcasecmp(rest, "download") == 0) {
+            return shortcutWaitForFlagClear(&download_running, "download");
+        }
+
+        char* end = NULL;
+        unsigned long wait_ms = strtoul(rest, &end, 10);
+        if (end == rest) {
+            cmdSetResult("Shortcut bad wait: %s", rest);
+            return false;
+        }
+        while (end && *end && isShortcutWhitespace(*end)) end++;
+        if (end && *end != '\0') {
+            cmdSetResult("Shortcut bad wait: %s", rest);
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(wait_ms));
+        return true;
+    }
+    if (strcasecmp(step, "remote") == 0 || strcasecmp(step, "exec") == 0) {
+        return runShortcutRemoteCommand(rest);
+    }
+    if (strcasecmp(step, "cmd") == 0) {
+        if (!rest || rest[0] == '\0') {
+            cmdSetResult("Shortcut: cmd <command>");
+            return false;
+        }
+        return executeCommand(rest);
+    }
+
+    return executeCommand(raw_step);
+}
+
+void shortcutTask(void* param) {
+    (void)param;
+
+    char path[SHORTCUT_PATH_MAX];
+    char name[SHORTCUT_NAME_MAX];
+    strncpy(path, shortcut_pending_path, sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+    strncpy(name, shortcut_pending_name, sizeof(name) - 1);
+    name[sizeof(name) - 1] = '\0';
+
+    char steps[SHORTCUT_MAX_STEPS][SHORTCUT_STEP_MAX];
+    int step_count = 0;
+    int parse_error_line = 0;
+    if (!loadShortcutSteps(path, steps, &step_count, &parse_error_line)) {
+        if (parse_error_line > 0) cmdSetResult("Shortcut parse fail L%d", parse_error_line);
+        else cmdSetResult("Shortcut load failed: %s", name);
+        render_requested = true;
+        shortcut_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+    if (step_count <= 0) {
+        cmdSetResult("Shortcut empty: %s", name);
+        render_requested = true;
+        shortcut_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    for (int i = 0; i < step_count; i++) {
+        cmdSetResult("Run %s %d/%d", name, i + 1, step_count);
+        render_requested = true;
+        if (!executeShortcutStep(steps[i])) {
+            if (!cmd_result_valid) cmdSetResult("Shortcut failed %s L%d", name, i + 1);
+            render_requested = true;
+            shortcut_running = false;
+            vTaskDelete(NULL);
+            return;
+        }
+    }
+
+    cmdSetResult("Shortcut done: %s", name);
+    render_requested = true;
+    shortcut_running = false;
+    vTaskDelete(NULL);
+}
+
+bool startShortcutByName(const char* raw_name) {
+    if (shortcut_running) {
+        cmdSetResult("Shortcut in progress...");
+        return false;
+    }
+
+    char path[SHORTCUT_PATH_MAX];
+    char name[SHORTCUT_NAME_MAX];
+    if (!resolveShortcutPath(raw_name, path, sizeof(path), name, sizeof(name))) {
+        return false;
+    }
+
+    strncpy(shortcut_pending_path, path, sizeof(shortcut_pending_path) - 1);
+    shortcut_pending_path[sizeof(shortcut_pending_path) - 1] = '\0';
+    strncpy(shortcut_pending_name, name, sizeof(shortcut_pending_name) - 1);
+    shortcut_pending_name[sizeof(shortcut_pending_name) - 1] = '\0';
+
+    shortcut_running = true;
+    BaseType_t rc = xTaskCreatePinnedToCore(
+        shortcutTask, "shortcut", SHORTCUT_TASK_STACK, NULL, 1, NULL, 1
+    );
+    if (rc != pdPASS) {
+        shortcut_running = false;
+        cmdSetResult("Shortcut task failed (%ld, heap=%d)", (long)rc, ESP.getFreeHeap());
+        return false;
+    }
+
+    cmdSetResult("Starting shortcut: %s", name);
+    return true;
 }
 
 // --- Power Off Art ---
@@ -806,7 +1264,7 @@ void dailyOpenCommand() {
     app_mode = MODE_NOTEPAD;
 }
 
-void executeCommand(const char* cmd) {
+bool executeCommand(const char* cmd) {
     // Parse command word and argument
     char word[CMD_BUF_LEN + 1];
     char arg[CMD_BUF_LEN + 1];
@@ -814,7 +1272,8 @@ void executeCommand(const char* cmd) {
     arg[0] = '\0';
 
     while (*cmd == ' ') cmd++;
-    if (*cmd == '\0') { cmd_result_valid = false; return; }
+    if (*cmd == '\0') { cmd_result_valid = false; return false; }
+    bool recognized = true;
 
     int wi = 0;
     while (*cmd && *cmd != ' ' && wi < CMD_BUF_LEN) word[wi++] = *cmd++;
@@ -892,39 +1351,9 @@ void executeCommand(const char* cmd) {
             cmdSetResult(ok ? "Removed %s" : "Failed: %s", arg);
         }
     } else if (strcmp(word, "u") == 0 || strcmp(word, "upload") == 0) {
-        if (!ssh_connected) {
-            cmdSetResult("SSH not connected");
-        } else if (download_running) {
-            cmdSetResult("Transfer in progress...");
-        } else if (upload_running) {
-            cmdSetResult("Upload in progress...");
-        } else {
-            BaseType_t rc = xTaskCreatePinnedToCore(
-                uploadTask, "upload", TRANSFER_TASK_STACK, NULL, 1, NULL, 1
-            );
-            if (rc == pdPASS) {
-                cmdSetResult("Starting upload...");
-            } else {
-                cmdSetResult("Upload task create failed (%ld, heap=%d)", (long)rc, ESP.getFreeHeap());
-            }
-        }
+        startUploadTransfer();
     } else if (strcmp(word, "d") == 0 || strcmp(word, "download") == 0) {
-        if (!ssh_connected) {
-            cmdSetResult("SSH not connected");
-        } else if (upload_running) {
-            cmdSetResult("Transfer in progress...");
-        } else if (download_running) {
-            cmdSetResult("Download in progress...");
-        } else {
-            BaseType_t rc = xTaskCreatePinnedToCore(
-                downloadTask, "download", TRANSFER_TASK_STACK, NULL, 1, NULL, 1
-            );
-            if (rc == pdPASS) {
-                cmdSetResult("Starting download...");
-            } else {
-                cmdSetResult("Download task create failed (%ld, heap=%d)", (long)rc, ESP.getFreeHeap());
-            }
-        }
+        startDownloadTransfer();
     }
     // --- Other commands ---
     else if (strcmp(word, "p") == 0 || strcmp(word, "paste") == 0) {
@@ -994,6 +1423,7 @@ void executeCommand(const char* cmd) {
                    timeSyncClockLooksValid() ? "set" : "unset",
                    timeSyncSourceName(time_sync_source));
         cmdAddLine("TZ:%s", timeSyncGetTimeZone());
+        if (shortcut_running) cmdAddLine("Shortcut:running");
         if (current_file.length() > 0) cmdAddLine("File:%s%s", current_file.c_str(), file_modified ? "*" : "");
     } else if (strcmp(word, "off") == 0) {
         poweroff_requested = true;
@@ -1003,10 +1433,20 @@ void executeCommand(const char* cmd) {
         cmdAddLine("daily (r)m (u)pload (d)ownload");
         cmdAddLine("(p)aste ssh (np)ad dc (ws)/scan");
         cmdAddLine("bt(toggle) gps gpson gpsoff gpsraw");
+        cmdAddLine("<name> runs /name.x shortcut");
         cmdAddLine("re(f)resh (s)tatus off (h)elp");
     } else {
-        cmdSetResult("Unknown: %s (?=help)", word);
+        if (arg[0] == '\0' && shortcut_running) {
+            cmdSetResult("Shortcut in progress...");
+            recognized = false;
+        } else if (arg[0] == '\0' && startShortcutByName(word)) {
+            // Shortcut started from <name> or <name>.x input.
+        } else {
+            cmdSetResult("Unknown: %s (?=help)", word);
+            recognized = false;
+        }
     }
+    return recognized;
 }
 
 bool handleCommandKeyPress(int event_code) {
@@ -1172,6 +1612,8 @@ void renderCommandPrompt() {
                      (int)download_done_count, (int)download_total_count,
                      done_s, total_s, rate_s);
             display.print(dl);
+        } else if (shortcut_running) {
+            display.print("[RUN] shortcut...");
         } else if (cmd_edit_picker_active) {
             display.print("[PICK] WASD nav ENTER open");
         } else {

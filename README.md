@@ -177,9 +177,36 @@ Single-tap **MIC** from either mode to open the command prompt (bottom half of s
 | `f` / `refresh` | Force full e-ink refresh |
 | `s` / `status` | Show WiFi/SSH/VPN/battery status (includes BT name/pair/peer) |
 | `?` / `h` / `help` | Show help |
+| `<name>` or `<name>.x` | Run shortcut script from `/<name>.x` |
 
 GNSS stays off by default and is only active after `gpson` (or `gnsson`).
 When GNSS has valid UTC + fix, firmware auto-syncs system clock. NTP sync (VPN path) also updates the same clock.
+
+### `.x` Shortcut Scripts
+
+Shortcut scripts are plain text files on SD root with extension `.x`.
+You can edit them with `edit <name>.x`, and run them by typing `<name>` (or `<name>.x`) in the command prompt.
+
+Supported steps (one per line):
+
+- `upload` / `u` - start upload task
+- `download` / `d` - start download task
+- `wait upload` or `wait download` - wait for transfer completion
+- `wait <ms>` - delay in milliseconds
+- `remote <command>` (or `exec <command>`) - run an SSH exec command on remote host, require exit code `0`
+- `cmd <command>` - run an existing command-palette command
+
+Blank lines and `#` comments are ignored.
+
+Example `deploy.x`:
+
+```text
+# Upload SD files, then move them on remote
+upload
+wait upload
+remote mkdir -p "$HOME/app/config"
+remote cp -f "$HOME/tdeck/"*.json "$HOME/app/config/"
+```
 
 ## Architecture
 
