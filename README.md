@@ -36,7 +36,7 @@ With debug firmware flashed, you can drive the device over serial:
 ```bash
 uv sync
 uv run scripts/tdeck_agent.py --boot-wait 2 "PING" "STATE"
-uv run scripts/tdeck_agent.py "MIC SINGLE" "WAIT 500" "STATE"
+uv run scripts/tdeck_agent.py "PRESS MIC" "WAIT 500" "STATE"
 uv run scripts/tdeck_agent.py "CMD ssh" "WAIT 300" "STATE"
 ```
 
@@ -138,7 +138,7 @@ Type on the keyboard. Text wraps to the e-ink display.
 
 ### Terminal
 
-Run `ssh` from the command prompt to switch to terminal mode. The device connects WiFi, tries SSH directly, and if the host isn't reachable falls back through WireGuard VPN automatically. Run `np` (or `notepad`) from the command prompt to return to notepad.
+Run `ssh` from the command prompt to switch to terminal mode. The device connects WiFi, tries SSH directly, and if the host isn't reachable falls back through WireGuard VPN automatically. Run `np` from the command prompt to return to notepad.
 
 - **Alt** — acts as ctrl - alt + space -> esc
 
@@ -159,27 +159,23 @@ Single-tap **MIC** from either mode to open the command prompt (bottom half of s
 | `l` / `ls` | List files on SD card |
 | `e` / `edit [file]` | Edit a file (loads into notepad). With no filename, opens interactive picker (W/S move, A/D page, Enter open). |
 | `w` / `save` | Save notepad to current file |
-| `n` / `new` | New file (auto-saves current) |
-| `daily` / `day` / `today` | Open today’s file as `YYYY-MM-DD.md` (local timezone) |
+| `daily` | Open today’s file as `YYYY-MM-DD.md` (local timezone) |
 | `r` / `rm <file>` | Delete a file |
 | `u` / `upload` | SCP all SD files to `~/tdeck` on SSH host |
 | `d` / `download` | SCP `~/tdeck` files to SD card |
 | `p` / `paste` | Paste notepad to SSH |
 | `ssh` | Switch to terminal mode and start SSH connect if needed |
-| `np` / `note` / `notepad` | Switch to notepad mode without clearing the buffer |
+| `np` | Switch to notepad mode without clearing the buffer |
 | `dc` | Disconnect SSH |
-| `ws` / `scan` | Scan WiFi and retry known APs manually |
-| `bt` / `bluetooth` | Toggle Bluetooth on/off |
-| `gnss` / `gps` | GNSS status |
-| `gnsson` / `gpson` | Power GNSS on |
-| `gnssoff` / `gpsoff` | Power GNSS off |
-| `gnssraw` / `gpsraw` | Show latest raw RMC/GGA lines |
-| `f` / `refresh` | Force full e-ink refresh |
-| `s` / `status` | Show WiFi/SSH/VPN/battery status (includes BT name/pair/peer) |
-| `?` / `h` / `help` | Show help |
+| `ws` | Scan WiFi and retry known APs manually |
+| `bt` | Toggle Bluetooth on/off |
+| `gnss` | Toggle GNSS on/off |
+| `gnssraw` | Show latest raw RMC/GGA lines |
+| `s` / `status` | Show WiFi/SSH/VPN/battery status (includes BT details + GNSS fix/sats) |
+| `h` / `help` | Show help |
 | `<name>` or `<name>.x` | Run shortcut script from `/<name>.x` |
 
-GNSS stays off by default and is only active after `gpson` (or `gnsson`).
+GNSS stays off by default and is activated by `gnss` toggle.
 When GNSS has valid UTC + fix, firmware auto-syncs system clock. NTP sync (VPN path) also updates the same clock.
 
 ### `.x` Shortcut Scripts
@@ -210,7 +206,7 @@ Supported steps (one per line):
 - `wait <ms>`: sleep/delay for milliseconds
 - `remote <command>` / `exec <command>`: run `<command>` on remote via SSH (`/bin/sh -s`), require remote exit code `0`
 - `cmd <command>`: run any existing command-palette command (for example `cmd daily`, `cmd ssh`, `cmd np`)
-- `<any command-palette command>`: bare command lines are also executed directly (`daily`, `new`, `status`, etc.)
+- `<any command-palette command>`: bare command lines are also executed directly (`daily`, `status`, etc.)
 
 Remote-step notes:
 

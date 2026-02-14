@@ -30,13 +30,13 @@ Use a working index (`opened=1`, `frame=1`, non-zero mean/std) as `--camera-sour
 2. Serial channel check:
    `uv run scripts/tdeck_agent.py --boot-wait 2 "PING" "STATE"`
 3. Drive scenario:
-   `uv run scripts/tdeck_agent.py "CMD new" "TEXT test-123" "RENDER" "WAIT 1200" "STATE"`
+   `uv run scripts/tdeck_agent.py "CMD rm __manual__.txt" "CMD edit __manual__.txt" "TEXT test-123" "RENDER" "WAIT 1200" "STATE"`
 4. Capture artifact:
    `uv run scripts/capture_webcam.py --image artifacts/test-123.jpg`
 5. Evaluate from protocol results + artifact.
 
 Keypress-driven examples:
-- Open command palette: `uv run scripts/tdeck_agent.py "MIC SINGLE" "WAIT 500" "STATE"`
+- Open command palette: `uv run scripts/tdeck_agent.py "PRESS MIC" "WAIT 500" "STATE"`
 - Open terminal (SSH attempt path): `uv run scripts/tdeck_agent.py "CMD ssh" "WAIT 300" "STATE"`
 - Return to notepad: `uv run scripts/tdeck_agent.py "CMD np" "WAIT 300" "STATE"`
 - Generic repeated press: `uv run scripts/tdeck_agent.py "PRESS MIC 2" "WAIT 300" "STATE"`

@@ -88,7 +88,7 @@ def main() -> int:
         action="store_true",
         help="Print non-AGENT serial lines while waiting for responses",
     )
-    parser.add_argument("commands", nargs="+", help="Commands like: PING, MODE, STATE, TEXT hello")
+    parser.add_argument("commands", nargs="+", help="Commands like: PING, STATE, PRESS MIC, TEXT hello")
     args = parser.parse_args()
 
     port = args.port or auto_detect_port()

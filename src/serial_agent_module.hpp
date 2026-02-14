@@ -101,11 +101,11 @@ static bool agentPressNamedKeyLocked(const char* name) {
     if (strcasecmp(name, "MIC") == 0) return agentPressKeyLocked(3, 6);
     if (strcasecmp(name, "ALT") == 0) return agentPressKeyLocked(2, 0);
     if (strcasecmp(name, "SYM") == 0) return agentPressKeyLocked(3, 8);
-    if (strcasecmp(name, "LSHIFT") == 0 || strcasecmp(name, "SHIFT") == 0) return agentPressKeyLocked(3, 9);
-    if (strcasecmp(name, "RSHIFT") == 0 || strcasecmp(name, "NAV") == 0) return agentPressKeyLocked(3, 5);
+    if (strcasecmp(name, "LSHIFT") == 0) return agentPressKeyLocked(3, 9);
+    if (strcasecmp(name, "RSHIFT") == 0) return agentPressKeyLocked(3, 5);
     if (strcasecmp(name, "SPACE") == 0) return agentPressKeyLocked(3, 7);
-    if (strcasecmp(name, "ENTER") == 0 || strcasecmp(name, "RETURN") == 0 || strcasecmp(name, "RET") == 0) return agentPressKeyLocked(2, 9);
-    if (strcasecmp(name, "BACKSPACE") == 0 || strcasecmp(name, "BS") == 0 || strcasecmp(name, "BKSP") == 0) return agentPressKeyLocked(1, 9);
+    if (strcasecmp(name, "ENTER") == 0) return agentPressKeyLocked(2, 9);
+    if (strcasecmp(name, "BACKSPACE") == 0) return agentPressKeyLocked(1, 9);
 
     // Single-character key tokens map to physical matrix positions.
     // This allows arbitrary key tapping by base legend (e.g. q, a, z, 1, ?, -).
@@ -128,7 +128,7 @@ static bool agentTypeOneCharLocked(char c, const char** err) {
         return false;
     }
     if (alt_mode || nav_mode) {
-        if (err) *err = "disable ALT/NAV before TEXT/CHAR";
+        if (err) *err = "disable ALT/NAV before TEXT";
         return false;
     }
 
@@ -237,7 +237,7 @@ static void agentRunCommand(char* line) {
         return;
     }
     if (strcasecmp(p, "HELP") == 0) {
-        agentReplyOk("commands=PING HELP MODE STATE RESULT KEY KEYNAME PRESS CHAR TEXT MIC CMD WAIT RENDER BOOTOFF");
+        agentReplyOk("commands=PING HELP STATE RESULT KEY PRESS TEXT CMD WAIT RENDER BOOTOFF");
         return;
     }
 
@@ -264,12 +264,6 @@ static void agentRunCommand(char* line) {
 
     if (!agentTakeStateLock()) {
         agentReplyErr("busy: state lock timeout");
-        return;
-    }
-
-    if (strcasecmp(p, "MODE") == 0) {
-        agentReplyOk("MODE %s", agentModeName(app_mode));
-        xSemaphoreGive(state_mutex);
         return;
     }
 
@@ -338,23 +332,7 @@ static void agentRunCommand(char* line) {
         return;
     }
 
-    if (strcasecmp(p, "KEYNAME") == 0) {
-        if (!arg || *arg == '\0') {
-            agentReplyErr("usage: @KEYNAME <name|single-char>");
-            xSemaphoreGive(state_mutex);
-            return;
-        }
-        if (!agentPressNamedKeyLocked(arg)) {
-            agentReplyErr("unknown keyname");
-            xSemaphoreGive(state_mutex);
-            return;
-        }
-        agentReplyOk("KEYNAME %s", arg);
-        xSemaphoreGive(state_mutex);
-        return;
-    }
-
-    if (strcasecmp(p, "PRESS") == 0 || strcasecmp(p, "TAP") == 0) {
+    if (strcasecmp(p, "PRESS") == 0) {
         if (!arg || *arg == '\0') {
             agentReplyErr("usage: @PRESS <token> [count]");
             xSemaphoreGive(state_mutex);
@@ -398,47 +376,6 @@ static void agentRunCommand(char* line) {
             }
         }
         agentReplyOk("PRESS %s x%ld", token, count);
-        xSemaphoreGive(state_mutex);
-        return;
-    }
-
-    if (strcasecmp(p, "MIC") == 0) {
-        if (!arg || *arg == '\0') {
-            agentReplyErr("usage: @MIC SINGLE");
-            xSemaphoreGive(state_mutex);
-            return;
-        }
-        if (strcasecmp(arg, "SINGLE") == 0) {
-            agentPressKeyLocked(3, 6);
-            agentReplyOk("MIC SINGLE");
-            xSemaphoreGive(state_mutex);
-            return;
-        }
-        agentReplyErr("usage: @MIC SINGLE");
-        xSemaphoreGive(state_mutex);
-        return;
-    }
-
-    if (strcasecmp(p, "CHAR") == 0) {
-        if (!arg || *arg == '\0') {
-            agentReplyErr("usage: @CHAR <c>");
-            xSemaphoreGive(state_mutex);
-            return;
-        }
-        char dec[8];
-        int n = agentDecodeEscapes(arg, dec, sizeof(dec));
-        if (n != 1) {
-            agentReplyErr("CHAR expects exactly one character");
-            xSemaphoreGive(state_mutex);
-            return;
-        }
-        const char* err = NULL;
-        if (!agentTypeOneCharLocked(dec[0], &err)) {
-            agentReplyErr("CHAR failed: %s", err ? err : "unknown");
-            xSemaphoreGive(state_mutex);
-            return;
-        }
-        agentReplyOk("CHAR");
         xSemaphoreGive(state_mutex);
         return;
     }

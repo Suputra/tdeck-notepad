@@ -1252,58 +1252,6 @@ void wifiScanCommand() {
     WiFi.scanDelete();
 }
 
-void gnssStatusCommand() {
-    GnssSnapshot snap;
-    gnssGetSnapshot(&snap);
-
-    cmdClearResult();
-    cmdAddLine("GNSS:%s fix:%s sats:%d",
-               snap.power_on ? "on" : "off",
-               snap.has_fix ? "yes" : "no",
-               snap.satellites);
-
-    if (snap.has_time) {
-        char utc[32];
-        if (gnssFormatUtc(&snap, utc, sizeof(utc))) {
-            cmdAddLine("UTC:%s", utc);
-        }
-    }
-
-    if (snap.has_location) {
-        cmdAddLine("Lat:%.5f", snap.latitude_deg);
-        cmdAddLine("Lon:%.5f", snap.longitude_deg);
-    }
-
-    if (snap.has_altitude || snap.has_hdop) {
-        char line[COLS_PER_LINE + 1];
-        line[0] = '\0';
-        if (snap.has_altitude && snap.has_hdop) {
-            snprintf(line, sizeof(line), "Alt:%.1fm HDOP:%.1f", snap.altitude_m, snap.hdop);
-        } else if (snap.has_altitude) {
-            snprintf(line, sizeof(line), "Alt:%.1fm", snap.altitude_m);
-        } else {
-            snprintf(line, sizeof(line), "HDOP:%.1f", snap.hdop);
-        }
-        cmdAddLine("%s", line);
-    }
-
-    if (snap.power_on && snap.last_rx_ms > 0) {
-        cmdAddLine("Rx age:%lums", (unsigned long)(millis() - snap.last_rx_ms));
-    } else if (snap.power_on) {
-        cmdAddLine("Rx age: n/a");
-    }
-
-    cmdAddLine("Clock:%s src:%s",
-               timeSyncClockLooksValid() ? "set" : "unset",
-               timeSyncSourceName(time_sync_source));
-    cmdAddLine("TZ:%s", timeSyncGetTimeZone());
-
-    cmdAddLine("NMEA:%lu CK:%lu PF:%lu",
-               (unsigned long)snap.total_sentences,
-               (unsigned long)snap.checksum_failures,
-               (unsigned long)snap.parse_failures);
-}
-
 void gnssRawCommand() {
     GnssSnapshot snap;
     gnssGetSnapshot(&snap);
@@ -1322,7 +1270,7 @@ void gnssRawCommand() {
 void dailyOpenCommand() {
     char name[20];
     if (!timeSyncMakeDailyFilename(name, sizeof(name))) {
-        cmdSetResult("Clock unset; gpson/WiFi");
+        cmdSetResult("Clock unset; gnss/WiFi");
         return;
     }
 
@@ -1346,7 +1294,7 @@ void dailyOpenCommand() {
 void clockDateCommand() {
     char stamp[40];
     if (!timeSyncFormatLocal(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S %Z")) {
-        cmdSetResult("Clock unset; gpson/WiFi");
+        cmdSetResult("Clock unset; gnss/WiFi");
         return;
     }
     cmdSetResult("%s (%s)", stamp, timeSyncSourceName(time_sync_source));
@@ -1419,15 +1367,7 @@ bool executeCommand(const char* cmd) {
         } else {
             cmdSetResult("Save failed");
         }
-    } else if (strcmp(word, "n") == 0 || strcmp(word, "new") == 0) {
-        autoSaveDirty();
-        text_len = 0; cursor_pos = 0; scroll_line = 0;
-        text_buf[0] = '\0';
-        current_file = "";
-        file_modified = false;
-        cmdSetResult("New buffer");
-        app_mode = MODE_NOTEPAD;
-    } else if (strcmp(word, "daily") == 0 || strcmp(word, "day") == 0 || strcmp(word, "today") == 0) {
+    } else if (strcmp(word, "daily") == 0) {
         dailyOpenCommand();
     } else if (strcmp(word, "r") == 0 || strcmp(word, "rm") == 0) {
         if (arg[0] == '\0') { cmdSetResult("r <name>"); }
@@ -1462,17 +1402,14 @@ bool executeCommand(const char* cmd) {
         if (!ssh_connected && !ssh_connecting) {
             sshConnectAsync();
         }
-    } else if (strcmp(word, "np") == 0 || strcmp(word, "note") == 0 || strcmp(word, "notepad") == 0) {
+    } else if (strcmp(word, "np") == 0) {
         app_mode = MODE_NOTEPAD;
     } else if (strcmp(word, "dc") == 0) {
         sshDisconnect();
         cmdSetResult("Disconnected");
-    } else if (strcmp(word, "ws") == 0 || strcmp(word, "scan") == 0) {
+    } else if (strcmp(word, "ws") == 0) {
         wifiScanCommand();
-    } else if (strcmp(word, "f") == 0 || strcmp(word, "refresh") == 0) {
-        partial_count = 100;
-        cmdSetResult("Full refresh queued");
-    } else if (strcmp(word, "bt") == 0 || strcmp(word, "bluetooth") == 0) {
+    } else if (strcmp(word, "bt") == 0) {
         if (arg[0] != '\0') {
             cmdSetResult("bt (toggle only)");
         } else {
@@ -1480,17 +1417,22 @@ bool executeCommand(const char* cmd) {
             btSetEnabled(next);
             cmdSetResult("BT %s (%s)", next ? "on" : "off", btStatusShort());
         }
-    } else if (strcmp(word, "gnss") == 0 || strcmp(word, "gps") == 0) {
-        gnssStatusCommand();
-    } else if (strcmp(word, "gnsson") == 0 || strcmp(word, "gpson") == 0) {
-        if (gnssSetPower(true)) cmdSetResult("GNSS on");
-        else cmdSetResult("GNSS already on");
-    } else if (strcmp(word, "gnssoff") == 0 || strcmp(word, "gpsoff") == 0) {
-        if (gnssSetPower(false)) cmdSetResult("GNSS off");
-        else cmdSetResult("GNSS already off");
-    } else if (strcmp(word, "gnssraw") == 0 || strcmp(word, "gpsraw") == 0) {
+    } else if (strcmp(word, "gnss") == 0) {
+        if (arg[0] != '\0') {
+            cmdSetResult("gnss (toggle only)");
+        } else {
+            bool next = !gnssIsPowered();
+            gnssSetPower(next);
+            GnssSnapshot snap;
+            gnssGetSnapshot(&snap);
+            char sats[8];
+            if (snap.satellites >= 0) snprintf(sats, sizeof(sats), "%d", snap.satellites);
+            else snprintf(sats, sizeof(sats), "-");
+            cmdSetResult("GNSS %s fix:%s sats:%s", next ? "on" : "off", snap.has_fix ? "yes" : "no", sats);
+        }
+    } else if (strcmp(word, "gnssraw") == 0) {
         gnssRawCommand();
-    } else if (strcmp(word, "date") == 0 || strcmp(word, "time") == 0 || strcmp(word, "now") == 0) {
+    } else if (strcmp(word, "date") == 0) {
         clockDateCommand();
     } else if (strcmp(word, "s") == 0 || strcmp(word, "status") == 0) {
         const char* ws = "off";
@@ -1508,6 +1450,15 @@ bool executeCommand(const char* cmd) {
         if (btPeerAddress()[0] != '\0') {
             cmdAddLine("BT peer:%s", btPeerAddress());
         }
+        GnssSnapshot gnss;
+        gnssGetSnapshot(&gnss);
+        char sats[8];
+        if (gnss.satellites >= 0) snprintf(sats, sizeof(sats), "%d", gnss.satellites);
+        else snprintf(sats, sizeof(sats), "-");
+        cmdAddLine("GNSS:%s fix:%s sats:%s",
+                   gnss.power_on ? "on" : "off",
+                   gnss.has_fix ? "yes" : "no",
+                   sats);
         cmdAddLine("Bat:%d%% Heap:%dK", battery_pct, ESP.getFreeHeap() / 1024);
         cmdAddLine("Clock:%s(%s)",
                    timeSyncClockLooksValid() ? "set" : "unset",
@@ -1515,17 +1466,13 @@ bool executeCommand(const char* cmd) {
         cmdAddLine("TZ:%s", timeSyncGetTimeZone());
         if (shortcut_running) cmdAddLine("Shortcut:running");
         if (current_file.length() > 0) cmdAddLine("File:%s%s", current_file.c_str(), file_modified ? "*" : "");
-    } else if (strcmp(word, "off") == 0) {
-        poweroff_requested = true;
-    } else if (strcmp(word, "?") == 0 || strcmp(word, "h") == 0 || strcmp(word, "help") == 0) {
+    } else if (strcmp(word, "h") == 0 || strcmp(word, "help") == 0) {
         cmdClearResult();
-        cmdAddLine("(l)ist (e)dit (w)rite (n)ew");
-        cmdAddLine("daily (r)m (u)pload (d)ownload");
-        cmdAddLine("(p)aste ssh (np)ad dc (ws)/scan");
-        cmdAddLine("bt(toggle) gps gpson gpsoff gpsraw");
-        cmdAddLine("date/time/now");
+        cmdAddLine("l/ls e/edit w/save daily r/rm");
+        cmdAddLine("u/upload d/download p/paste ssh np dc");
+        cmdAddLine("ws bt gnss gnssraw");
+        cmdAddLine("date s/status h/help");
         cmdAddLine("<name> runs /name.x shortcut");
-        cmdAddLine("re(f)resh (s)tatus off (h)elp");
     } else {
         if (arg[0] == '\0' && shortcut_running) {
             cmdSetResult("Shortcut in progress...");
@@ -1533,7 +1480,7 @@ bool executeCommand(const char* cmd) {
         } else if (arg[0] == '\0' && startShortcutByName(word)) {
             // Shortcut started from <name> or <name>.x input.
         } else {
-            cmdSetResult("Unknown: %s (?=help)", word);
+            cmdSetResult("Unknown: %s (h=help)", word);
             recognized = false;
         }
     }
@@ -1713,7 +1660,7 @@ void renderCommandPrompt() {
         } else if (cmd_edit_picker_active) {
             display.print("[PICK] WASD nav ENTER open");
         } else {
-            display.print("[CMD] ? help | MIC exit");
+            display.print("[CMD] h/help | MIC exit");
         }
     } while (display.nextPage());
 }

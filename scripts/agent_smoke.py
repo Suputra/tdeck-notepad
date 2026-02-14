@@ -88,7 +88,8 @@ def main() -> int:
     if args.boot_wait > 0:
         tdeck_cmd += ["--boot-wait", str(args.boot_wait)]
     tdeck_cmd += [
-        "CMD new",
+        "CMD rm __agent_smoke__.txt",
+        "CMD edit __agent_smoke__.txt",
         f"TEXT {marker}",
         "RENDER",
         f"WAIT {args.wait_ms}",

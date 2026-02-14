@@ -80,28 +80,24 @@ Send one command per line with `@` prefix.
 
 - `@PING`
 - `@HELP`
-- `@MODE`
 - `@STATE`
 - `@KEY <row> <col_rev>`
-- `@KEYNAME <special|single-char>`
 - `@PRESS <token> [count]`
-- `@CHAR <char>`
 - `@TEXT <text-with-escapes>`
-- `@MIC SINGLE`
 - `@CMD <device-command-mode-command>`
 - `@WAIT <ms>`
 - `@RENDER`
 - `@BOOTOFF`
 
-Escapes in `TEXT`/`CHAR`: `\\n`, `\\r`, `\\t`, `\\\\`, `\\s`.
+Escapes in `TEXT`: `\\n`, `\\r`, `\\t`, `\\\\`, `\\s`.
 
-`KEYNAME`/`PRESS` tokens:
+`PRESS` tokens:
 - Special: `MIC`, `ALT`, `SYM`, `LSHIFT`, `RSHIFT`, `SPACE`, `ENTER`, `BACKSPACE`
 - Single-char physical key tokens: letters and symbol-key positions, e.g. `q`, `w`, `1`, `?`, `-`
 
 Quick keypress examples:
 ```bash
-uv run scripts/tdeck_agent.py "MIC SINGLE" "WAIT 500" "STATE"     # opens command mode
+uv run scripts/tdeck_agent.py "PRESS MIC" "WAIT 500" "STATE"      # opens command mode
 uv run scripts/tdeck_agent.py "CMD ssh" "WAIT 300" "STATE"        # switches to terminal/SSH mode
 uv run scripts/tdeck_agent.py "CMD np" "WAIT 300" "STATE"         # returns to notepad mode
 ```
@@ -109,7 +105,7 @@ uv run scripts/tdeck_agent.py "CMD np" "WAIT 300" "STATE"         # returns to n
 ## Troubleshooting
 - `AGENT ERR`: treat as scenario failure; fix command or firmware behavior.
 - Camera opened but frame is black: verify IP stream URL, or for local webcam use `scripts/probe_cameras.py` and switch `--camera-source`; increase `--warmup`.
-- `TEXT` fails due to active modifier mode: use explicit `KEY`/`KEYNAME` commands first.
+- `TEXT` fails due to active modifier mode: use explicit `KEY`/`PRESS` commands first.
 - `TEXT` fails on marker character `0`: use marker text without `0` or type `0` via key-level commands.
 - Need release validation: flash production env and rerun manual or non-agent checks.
 
