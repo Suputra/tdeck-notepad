@@ -127,8 +127,8 @@ static bool agentTypeOneCharLocked(char c, const char** err) {
         if (err) *err = "TAB requires explicit key combos in this firmware";
         return false;
     }
-    if (alt_mode || nav_mode) {
-        if (err) *err = "disable ALT/NAV before TEXT";
+    if (alt_mode && app_mode == MODE_TERMINAL) {
+        if (err) *err = "disable ALT before TEXT";
         return false;
     }
 

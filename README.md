@@ -134,13 +134,14 @@ Type on the keyboard. Text wraps to the e-ink display.
 
 - **Shift** — sticky uppercase (one letter)
 - **Sym** — one-shot symbol/number layer
-- **Alt** — toggles nav mode (WASD = arrows, backspace = delete forward)
+- **Touch tap** — directional arrows (tap away from center for up/down/left/right)
 
 ### Terminal
 
 Run `ssh` from the command prompt to switch to terminal mode. The device connects WiFi, tries SSH directly, and if the host isn't reachable falls back through WireGuard VPN automatically. Run `np` from the command prompt to return to notepad.
 
 - **Alt** — acts as ctrl - alt + space -> esc
+- **Touch tap** — sends terminal arrow keys (up/down/left/right)
 
 ### Bluetooth (bare mode)
 
@@ -153,6 +154,7 @@ To reduce unwanted phone wakes, advertising is not kept alive indefinitely.
 ### Command Processor
 
 Single-tap **MIC** from either mode to open the command prompt (bottom half of screen).
+Touch **Up/Down arrows** in command mode to browse previous/next commands.
 
 | Command | Description |
 |---------|-------------|

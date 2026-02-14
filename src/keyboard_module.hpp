@@ -54,10 +54,9 @@ bool handleNotepadKeyPress(int event_code) {
     if (row < 0 || row >= KEYPAD_ROWS || col_rev < 0 || col_rev >= KEYPAD_COLS) return false;
 
     // Modifier keys
-    if (IS_LSHIFT(row, col_rev)) { shift_held = !shift_held; return false; }
-    if (IS_RSHIFT(row, col_rev)) { nav_mode = !nav_mode; return true; }
+    if (IS_SHIFT(row, col_rev))  { shift_held = !shift_held; return false; }
     if (IS_SYM(row, col_rev))    { sym_mode = true; return true; }
-    if (IS_ALT(row, col_rev))    { alt_mode = !alt_mode; return true; }
+    if (IS_ALT(row, col_rev))    { alt_mode = false; return false; }
     if (IS_MIC(row, col_rev))    {
         if (sym_mode) {
             sym_mode = false;
@@ -75,27 +74,6 @@ bool handleNotepadKeyPress(int event_code) {
         return false;
     }
     if (IS_DEAD(row, col_rev))   { return false; }
-
-    // Nav mode: WASD arrows + backspace delete
-    if (nav_mode) {
-        char base = keymap_lower[row][col_rev];
-        if (base == 'w')      cursorUp();
-        else if (base == 'a') cursorLeft();
-        else if (base == 's') cursorDown();
-        else if (base == 'd') cursorRight();
-        else if (base == '\b') {
-            if (cursor_pos > 0) {
-                memmove(&text_buf[cursor_pos - 1], &text_buf[cursor_pos], text_len - cursor_pos);
-                text_len--;
-                cursor_pos--;
-                text_buf[text_len] = '\0';
-                file_modified = true;
-            } else return false;
-        }
-        else if (alt_mode && base == 'f') { alt_mode = false; partial_count = 100; render_requested = true; return false; }
-        else return false;
-        return true;
-    }
 
     char c;
     if (sym_mode)        { c = keymap_sym[row][col_rev]; sym_mode = false; }
@@ -143,8 +121,7 @@ bool handleTerminalKeyPress(int event_code) {
 
     if (row < 0 || row >= KEYPAD_ROWS || col_rev < 0 || col_rev >= KEYPAD_COLS) return false;
 
-    if (IS_LSHIFT(row, col_rev)) { shift_held = !shift_held; return false; }
-    if (IS_RSHIFT(row, col_rev)) { nav_mode = !nav_mode; return true; }
+    if (IS_SHIFT(row, col_rev))  { shift_held = !shift_held; return false; }
     if (IS_SYM(row, col_rev))    { sym_mode = true; return true; }
     if (IS_ALT(row, col_rev))    { alt_mode = !alt_mode; return true; }
     if (IS_MIC(row, col_rev))    {
@@ -153,17 +130,6 @@ bool handleTerminalKeyPress(int event_code) {
         return false;
     }
     if (IS_DEAD(row, col_rev))   { return false; }
-
-    // Nav mode: WASD sends arrow escape sequences
-    if (nav_mode) {
-        char base = keymap_lower[row][col_rev];
-        if (base == 'w') { sshSendString("\x1b[A", 3); return false; }
-        if (base == 's') { sshSendString("\x1b[B", 3); return false; }
-        if (base == 'd') { sshSendString("\x1b[C", 3); return false; }
-        if (base == 'a') { sshSendString("\x1b[D", 3); return false; }
-        if (base == '\b') { sshSendKey(0x7F); return false; }
-        return false;
-    }
 
     // Alt = Ctrl modifier
     if (alt_mode) {

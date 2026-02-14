@@ -124,7 +124,6 @@ void drawStatusBar(const LayoutInfo& info) {
     char mods[16] = "";
     if (snap_shift) strcat(mods, "SH ");
     if (snap_sym)   strcat(mods, "SY ");
-    if (snap_nav)   strcat(mods, "NV ");
     // Show filename if editing a file
     const char* fname = "";
     if (current_file.length() > 0) {
@@ -352,8 +351,6 @@ void snapshotState() {
     snap_scroll = scroll_line;
     snap_shift  = shift_held;
     snap_sym    = sym_mode;
-    snap_alt    = alt_mode;
-    snap_nav    = nav_mode;
 }
 
 // --- Display Task (Core 0) ---

@@ -92,15 +92,23 @@ static uint8_t touch_i2c_addr = 0x1A;  // Will be auto-detected (0x1A or 0x5A)
 // Touch scroll state machine
 enum TouchState { TOUCH_IDLE, TOUCH_ACTIVE };
 static TouchState touch_state = TOUCH_IDLE;
+static int16_t touch_start_x = 0;
 static int16_t touch_start_y = 0;
+static int16_t touch_last_x = 0;
+static int16_t touch_last_y = 0;
+static unsigned long touch_start_ms = 0;
+static bool touch_did_scroll = false;
 static unsigned long last_touch_poll = 0;
 static constexpr unsigned long TOUCH_POLL_INTERVAL_MS = 90;
 static constexpr int16_t TOUCH_SCROLL_THRESHOLD = 16; // 2 text lines worth of pixels
+static constexpr unsigned long TOUCH_TAP_MAX_MS = 300;
+static constexpr int16_t TOUCH_TAP_DEADZONE_X = SCREEN_W / 8;
+static constexpr int16_t TOUCH_TAP_DEADZONE_Y = (SCREEN_H - STATUS_H) / 8;
 static constexpr int TOUCH_SCROLL_MAX_STEPS_PER_POLL = 3;
 
 // Read 7 bytes from CST226SE register 0xD000 (touch data report)
-// Returns: 1=touched (y set), 0=not touched, -1=I2C failure
-static int cst226ReadTouch(int16_t* y) {
+// Returns: 1=touched (x/y set), 0=not touched, -1=I2C failure
+static int cst226ReadTouch(int16_t* x, int16_t* y) {
     // Write 2-byte register address 0xD000
     Wire.beginTransmission(touch_i2c_addr);
     Wire.write((uint8_t)0xD0);
@@ -120,8 +128,9 @@ static int cst226ReadTouch(int16_t* y) {
     // data[1]: X high 8 bits, data[2]: Y high 8 bits
     // data[3]: X low 4 | Y low 4, data[4]: pressure
     bool touched = ((data[0] & 0x0F) == 0x06);
-    if (touched && y) {
-        *y = (int16_t)((data[2] << 4) | (data[3] & 0x0F));
+    if (touched) {
+        if (x) *x = (int16_t)((data[1] << 4) | ((data[3] >> 4) & 0x0F));
+        if (y) *y = (int16_t)((data[2] << 4) | (data[3] & 0x0F));
     }
     return touched ? 1 : 0;
 }
@@ -138,6 +147,11 @@ static volatile AppMode app_mode = MODE_NOTEPAD;
 static char cmd_buf[CMD_BUF_LEN + 1];
 static int  cmd_len = 0;
 static AppMode cmd_return_mode = MODE_NOTEPAD;  // Mode to return to after command
+static constexpr int CMD_HISTORY_CAP = 20;
+static char cmd_history[CMD_HISTORY_CAP][CMD_BUF_LEN + 1];
+static int  cmd_history_count = 0;
+static int  cmd_history_nav = -1; // -1 = editing live buffer, otherwise history index
+static char cmd_history_draft[CMD_BUF_LEN + 1];
 
 // Multi-line command result (half screen)
 #define CMD_RESULT_LINES 13
@@ -166,7 +180,6 @@ static int  scroll_line = 0;
 static bool shift_held  = false;
 static bool sym_mode    = false;
 static bool alt_mode    = false;   // Ctrl modifier in terminal, unused in notepad
-static bool nav_mode    = false;   // WASD arrow keys (right shift toggle)
 static unsigned long terminal_last_ctrl_c_ms = 0;
 
 // Display task snapshot — private to core 0
@@ -176,8 +189,14 @@ static int  snap_cursor    = 0;
 static int  snap_scroll    = 0;
 static bool snap_shift     = false;
 static bool snap_sym       = false;
-static bool snap_alt       = false;
-static bool snap_nav       = false;
+
+enum TouchTapArrow {
+    TOUCH_TAP_ARROW_NONE,
+    TOUCH_TAP_ARROW_UP,
+    TOUCH_TAP_ARROW_DOWN,
+    TOUCH_TAP_ARROW_LEFT,
+    TOUCH_TAP_ARROW_RIGHT,
+};
 
 // --- Terminal State (shared, protected by state_mutex) ---
 
@@ -1249,6 +1268,82 @@ void cmdSetResult(const char* fmt, ...) {
     cmd_result_valid = true;
 }
 
+// Caller must hold state_mutex.
+static void cmdSetBufferLocked(const char* src) {
+    if (!src) src = "";
+    strncpy(cmd_buf, src, CMD_BUF_LEN);
+    cmd_buf[CMD_BUF_LEN] = '\0';
+    cmd_len = (int)strlen(cmd_buf);
+}
+
+// Caller must hold state_mutex.
+static void cmdHistoryResetBrowseLocked() {
+    cmd_history_nav = -1;
+    cmd_history_draft[0] = '\0';
+}
+
+// Caller must hold state_mutex.
+static void cmdHistoryAddLocked(const char* cmd) {
+    if (!cmd) return;
+
+    const char* p = cmd;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '\0') return; // Ignore empty commands.
+
+    if (cmd_history_count > 0) {
+        if (strcmp(cmd_history[cmd_history_count - 1], cmd) == 0) {
+            cmdHistoryResetBrowseLocked();
+            return;
+        }
+    }
+
+    if (cmd_history_count < CMD_HISTORY_CAP) {
+        strncpy(cmd_history[cmd_history_count], cmd, CMD_BUF_LEN);
+        cmd_history[cmd_history_count][CMD_BUF_LEN] = '\0';
+        cmd_history_count++;
+    } else {
+        for (int i = 1; i < CMD_HISTORY_CAP; i++) {
+            memcpy(cmd_history[i - 1], cmd_history[i], CMD_BUF_LEN + 1);
+        }
+        strncpy(cmd_history[CMD_HISTORY_CAP - 1], cmd, CMD_BUF_LEN);
+        cmd_history[CMD_HISTORY_CAP - 1][CMD_BUF_LEN] = '\0';
+        cmd_history_count = CMD_HISTORY_CAP;
+    }
+
+    cmdHistoryResetBrowseLocked();
+}
+
+// Caller must hold state_mutex.
+// `direction` is -1 for older command, +1 for newer command.
+static bool cmdHistoryBrowseLocked(int direction) {
+    if (cmd_history_count <= 0) return false;
+    if (direction != -1 && direction != 1) return false;
+
+    if (direction == -1) {
+        if (cmd_history_nav < 0) {
+            strncpy(cmd_history_draft, cmd_buf, CMD_BUF_LEN);
+            cmd_history_draft[CMD_BUF_LEN] = '\0';
+            cmd_history_nav = cmd_history_count - 1;
+        } else if (cmd_history_nav > 0) {
+            cmd_history_nav--;
+        } else {
+            return false;
+        }
+        cmdSetBufferLocked(cmd_history[cmd_history_nav]);
+        return true;
+    }
+
+    if (cmd_history_nav < 0) return false;
+    if (cmd_history_nav < cmd_history_count - 1) {
+        cmd_history_nav++;
+        cmdSetBufferLocked(cmd_history[cmd_history_nav]);
+    } else {
+        cmd_history_nav = -1;
+        cmdSetBufferLocked(cmd_history_draft);
+    }
+    return true;
+}
+
 int cmdEditPickerVisibleRows() {
     int rows = CMD_RESULT_LINES - 1; // Reserve first line for picker status/help text
     if (rows < 1) rows = 1;
@@ -1476,6 +1571,74 @@ static void terminalSendMouseWheel(bool wheel_up) {
     sshSendString(seq, 6);
 }
 
+static void terminalSendArrowKey(TouchTapArrow arrow) {
+    switch (arrow) {
+        case TOUCH_TAP_ARROW_UP:    sshSendString("\x1b[A", 3); break;
+        case TOUCH_TAP_ARROW_DOWN:  sshSendString("\x1b[B", 3); break;
+        case TOUCH_TAP_ARROW_RIGHT: sshSendString("\x1b[C", 3); break;
+        case TOUCH_TAP_ARROW_LEFT:  sshSendString("\x1b[D", 3); break;
+        default: break;
+    }
+}
+
+static TouchTapArrow touchTapArrowFromPoint(int16_t x, int16_t y) {
+    const int touch_h = SCREEN_H - STATUS_H;
+    if (x < 0 || x >= SCREEN_W || y < 0 || y >= touch_h) {
+        return TOUCH_TAP_ARROW_NONE;
+    }
+
+    int dx = x - (SCREEN_W / 2);
+    int dy = y - (touch_h / 2);
+    int adx = abs(dx);
+    int ady = abs(dy);
+    if (adx < TOUCH_TAP_DEADZONE_X && ady < TOUCH_TAP_DEADZONE_Y) {
+        return TOUCH_TAP_ARROW_NONE;
+    }
+
+    if (adx >= ady) {
+        return dx < 0 ? TOUCH_TAP_ARROW_LEFT : TOUCH_TAP_ARROW_RIGHT;
+    }
+    return dy < 0 ? TOUCH_TAP_ARROW_UP : TOUCH_TAP_ARROW_DOWN;
+}
+
+// Caller must hold state_mutex.
+static void handleTouchArrowTapLocked(TouchTapArrow arrow) {
+    if (arrow == TOUCH_TAP_ARROW_NONE) return;
+
+    if (app_mode == MODE_NOTEPAD) {
+        int old_cursor = cursor_pos;
+        if (arrow == TOUCH_TAP_ARROW_UP) cursorUp();
+        else if (arrow == TOUCH_TAP_ARROW_DOWN) cursorDown();
+        else if (arrow == TOUCH_TAP_ARROW_LEFT) cursorLeft();
+        else if (arrow == TOUCH_TAP_ARROW_RIGHT) cursorRight();
+        if (cursor_pos != old_cursor) {
+            render_requested = true;
+        }
+        return;
+    }
+
+    if (app_mode == MODE_TERMINAL) {
+        terminalSendArrowKey(arrow);
+        return;
+    }
+
+    if (app_mode == MODE_COMMAND) {
+        bool changed = false;
+        if (cmd_edit_picker_active) {
+            if (arrow == TOUCH_TAP_ARROW_UP) changed = cmdEditPickerMoveSelection(-1);
+            else if (arrow == TOUCH_TAP_ARROW_DOWN) changed = cmdEditPickerMoveSelection(1);
+            else if (arrow == TOUCH_TAP_ARROW_LEFT) changed = cmdEditPickerPage(-1);
+            else if (arrow == TOUCH_TAP_ARROW_RIGHT) changed = cmdEditPickerPage(1);
+        } else {
+            if (arrow == TOUCH_TAP_ARROW_UP) changed = cmdHistoryBrowseLocked(-1);
+            else if (arrow == TOUCH_TAP_ARROW_DOWN) changed = cmdHistoryBrowseLocked(1);
+        }
+        if (changed) {
+            render_requested = true;
+        }
+    }
+}
+
 void setup() {
     SERIAL_LOG_BEGIN(115200);
 #if TDECK_AGENT_DEBUG
@@ -1685,6 +1848,7 @@ void loop() {
             cmd_return_mode = app_mode;
             cmd_len = 0;
             cmd_buf[0] = '\0';
+            cmdHistoryResetBrowseLocked();
             cmd_result_valid = false;
             cmdEditPickerStop();
             app_mode = MODE_COMMAND;
@@ -1695,16 +1859,23 @@ void loop() {
 
     // --- Touch scroll polling ---
     if (touch_available && (millis() - last_touch_poll >= TOUCH_POLL_INTERVAL_MS)) {
-        last_touch_poll = millis();
+        unsigned long now = millis();
+        last_touch_poll = now;
+        int16_t cur_x = 0;
         int16_t cur_y = 0;
-        int touch_result = cst226ReadTouch(&cur_y);
+        int touch_result = cst226ReadTouch(&cur_x, &cur_y);
         bool is_touched = (touch_result == 1);
 
         if (is_touched) {
+            touch_last_x = cur_x;
+            touch_last_y = cur_y;
             if (touch_state == TOUCH_IDLE) {
                 // Touch just started
                 touch_state = TOUCH_ACTIVE;
+                touch_start_x = cur_x;
                 touch_start_y = cur_y;
+                touch_start_ms = now;
+                touch_did_scroll = false;
             } else {
                 // Continuing touch — check for scroll gesture
                 int16_t delta_y = cur_y - touch_start_y;
@@ -1752,11 +1923,29 @@ void loop() {
                             xSemaphoreGive(state_mutex);
                         }
                         touch_start_y = cur_y;
+                        touch_did_scroll = true;
                     }
                 }
             }
         } else {
+            if (touch_state == TOUCH_ACTIVE && !touch_did_scroll) {
+                unsigned long tap_ms = now - touch_start_ms;
+                int16_t move_x = touch_last_x - touch_start_x;
+                int16_t move_y = touch_last_y - touch_start_y;
+                bool moved_too_far = (move_x > TOUCH_SCROLL_THRESHOLD || move_x < -TOUCH_SCROLL_THRESHOLD
+                    || move_y > TOUCH_SCROLL_THRESHOLD || move_y < -TOUCH_SCROLL_THRESHOLD);
+                if (tap_ms <= TOUCH_TAP_MAX_MS && !moved_too_far) {
+                    TouchTapArrow arrow = touchTapArrowFromPoint(touch_last_x, touch_last_y);
+                    if (arrow != TOUCH_TAP_ARROW_NONE) {
+                        if (xSemaphoreTake(state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                            handleTouchArrowTapLocked(arrow);
+                            xSemaphoreGive(state_mutex);
+                        }
+                    }
+                }
+            }
             touch_state = TOUCH_IDLE;
+            touch_did_scroll = false;
         }
     }
 

@@ -1110,6 +1110,10 @@ void powerOff() {
     // Render ASCII art as pixel bitmap on e-ink, then deep sleep
     const int art_height = POWEROFF_ART_LINES * POWEROFF_ART_PX_H;
     const int y_offset = (SCREEN_H - art_height) / 2;
+    static const char footer_text[] = "saah.as";
+    const int footer_top = y_offset + art_height;
+    const int footer_height = SCREEN_H - footer_top;
+    const int footer_width = (int)(sizeof(footer_text) - 1) * CHAR_W;
 
     display.setFullWindow();
     display.firstPage();
@@ -1142,6 +1146,16 @@ void powerOff() {
                 col++;
             }
             p++;
+        }
+
+        if (footer_height >= CHAR_H) {
+            int footer_x = (SCREEN_W - footer_width) / 2;
+            if (footer_x < 0) footer_x = 0;
+            int footer_y = footer_top + (footer_height - CHAR_H) / 2;
+            display.setTextColor(GxEPD_BLACK);
+            display.setFont(NULL);
+            display.setCursor(footer_x, footer_y);
+            display.print(footer_text);
         }
     } while (display.nextPage());
 
@@ -1652,6 +1666,7 @@ bool handleCommandKeyPress(int event_code) {
         char command[CMD_BUF_LEN + 1];
         strncpy(command, cmd_buf, sizeof(command) - 1);
         command[sizeof(command) - 1] = '\0';
+        cmdHistoryAddLocked(command);
         cmd_len = 0;
         cmd_buf[0] = '\0';
         xSemaphoreGive(state_mutex);
@@ -1751,7 +1766,7 @@ void renderCommandPrompt() {
         } else if (shortcut_running) {
             display.print("[RUN] shortcut...");
         } else if (cmd_edit_picker_active) {
-            display.print("[PICK] WASD nav ENTER open");
+            display.print("[PICK] W/S move A/D page Enter");
         } else {
             display.print("[CMD] h/help | MIC exit");
         }

@@ -14,7 +14,7 @@ Use Alt+key combos to send control characters over SSH:
 - **Alt + Enter** → Tab (0x09)
 
 This reuses the existing alt_mode toggle. When Alt is active:
-- Arrow keys (R/D/C/G) still work for cursor movement
+- Touch taps still send arrow keys
 - Letter keys send Ctrl+letter (ASCII 1-26)
 - Space sends Escape
 - Enter sends Tab
@@ -24,12 +24,11 @@ This reuses the existing alt_mode toggle. When Alt is active:
 | Key | Sends | Use |
 |-----|-------|-----|
 | Alt+C | 0x03 | Ctrl+C (interrupt) |
-| Alt+D | 0x04 | Ctrl+D (EOF) — NOTE: conflicts with Left arrow |
+| Alt+D | 0x04 | Ctrl+D (EOF) |
 | Alt+Z | 0x1A | Ctrl+Z (suspend) |
 | Alt+L | 0x0C | Ctrl+L (clear screen) |
 | Alt+A | 0x01 | Ctrl+A (tmux/screen prefix) |
 | Alt+Space | 0x1B | Escape |
 | Alt+Enter | 0x09 | Tab |
 
-Note: Alt+D conflict with left arrow resolved by keeping RDCG as arrows,
-all other letters become Ctrl+letter.
+Directional arrows are independent touch-tap gestures.
