@@ -15,6 +15,8 @@ bool wifiSyncClockNtp() {
     if (WiFi.status() != WL_CONNECTED) return false;
 
     configTime(0, 0, WIFI_NTP_SERVER_PRIMARY, WIFI_NTP_SERVER_SECONDARY);
+    // configTime() can reset TZ to UTC; reapply configured POSIX TZ so local dates stay correct.
+    timeSyncSetTimeZone(timeSyncGetTimeZone());
     struct tm tm = {};
     for (uint8_t i = 0; i < WIFI_NTP_SYNC_TRIES; i++) {
         if (getLocalTime(&tm, WIFI_NTP_SYNC_RETRY_MS)) {

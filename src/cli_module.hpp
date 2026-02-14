@@ -1169,6 +1169,87 @@ void powerOff() {
 
 // --- Command Processor ---
 
+bool wifiConnectKnownAndSyncClock(bool sync_clock, bool* out_clock_synced = NULL) {
+    if (out_clock_synced) *out_clock_synced = false;
+
+    WiFi.mode(WIFI_STA);
+    wifiClearLastFailure();
+
+    if (WiFi.status() == WL_CONNECTED) {
+        wifi_state = WIFI_CONNECTED;
+        if (sync_clock) {
+            bool synced = wifiSyncClockNtp();
+            if (out_clock_synced) *out_clock_synced = synced;
+        }
+        return true;
+    }
+
+    if (config_wifi_count <= 0) {
+        wifi_state = WIFI_FAILED;
+        wifiSetLastFailure("(config)", "no APs in /CONFIG");
+        return false;
+    }
+
+    for (int i = 0; i < config_wifi_count; i++) {
+        WiFiAttemptResult attempt = wifiTryAP(config_wifi[i].ssid, config_wifi[i].pass, WIFI_CONNECT_TIMEOUT_MS);
+        if (attempt.connected) {
+            wifi_state = WIFI_CONNECTED;
+            wifiClearLastFailure();
+            if (sync_clock) {
+                bool synced = wifiSyncClockNtp();
+                if (out_clock_synced) *out_clock_synced = synced;
+            }
+            return true;
+        }
+
+        char reason[48];
+        wifiFormatFailureReason(attempt, reason, sizeof(reason));
+        wifi_state = WIFI_FAILED;
+        wifiSetLastFailure(config_wifi[i].ssid, reason);
+    }
+
+    return false;
+}
+
+bool ensureClockForDateDaily() {
+    if (timeSyncClockLooksValid()) return true;
+    bool ntp_synced = false;
+    if (!wifiConnectKnownAndSyncClock(true, &ntp_synced)) return false;
+    return ntp_synced && timeSyncClockLooksValid();
+}
+
+void wifiToggleCommand() {
+    wifi_mode_t mode = WiFi.getMode();
+    bool wifi_enabled = (mode != WIFI_OFF) || wifi_state == WIFI_CONNECTED || wifi_state == WIFI_CONNECTING;
+
+    if (wifi_enabled) {
+        if (ssh_connected || ssh_connecting) {
+            sshDisconnect();
+        }
+        vpnDisconnect();
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        wifi_state = WIFI_IDLE;
+        wifiClearLastFailure();
+        cmdSetResult("WiFi off");
+        return;
+    }
+
+    bool ntp_synced = false;
+    bool connected = wifiConnectKnownAndSyncClock(true, &ntp_synced);
+    if (!connected) {
+        if (wifi_last_fail_ssid[0] != '\0') {
+            cmdSetResult("WiFi fail: %s", wifi_last_fail_ssid);
+        } else {
+            cmdSetResult("WiFi fail");
+        }
+        return;
+    }
+
+    String ip = WiFi.localIP().toString();
+    cmdSetResult("WiFi on %s NTP:%s", ip.c_str(), ntp_synced ? "ok" : "fail");
+}
+
 void wifiScanCommand() {
     WiFi.mode(WIFI_STA);
     int n = WiFi.scanNetworks();
@@ -1269,6 +1350,9 @@ void gnssRawCommand() {
 
 void dailyOpenCommand() {
     char name[20];
+    if (!timeSyncClockLooksValid()) {
+        ensureClockForDateDaily();
+    }
     if (!timeSyncMakeDailyFilename(name, sizeof(name))) {
         cmdSetResult("Clock unset; gnss/WiFi");
         return;
@@ -1293,6 +1377,9 @@ void dailyOpenCommand() {
 
 void clockDateCommand() {
     char stamp[40];
+    if (!timeSyncClockLooksValid()) {
+        ensureClockForDateDaily();
+    }
     if (!timeSyncFormatLocal(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S %Z")) {
         cmdSetResult("Clock unset; gnss/WiFi");
         return;
@@ -1409,6 +1496,12 @@ bool executeCommand(const char* cmd) {
         cmdSetResult("Disconnected");
     } else if (strcmp(word, "ws") == 0) {
         wifiScanCommand();
+    } else if (strcmp(word, "wifi") == 0) {
+        if (arg[0] != '\0') {
+            cmdSetResult("wifi (toggle only)");
+        } else {
+            wifiToggleCommand();
+        }
     } else if (strcmp(word, "bt") == 0) {
         if (arg[0] != '\0') {
             cmdSetResult("bt (toggle only)");
@@ -1470,7 +1563,7 @@ bool executeCommand(const char* cmd) {
         cmdClearResult();
         cmdAddLine("l/ls e/edit w/save daily r/rm");
         cmdAddLine("u/upload d/download p/paste ssh np dc");
-        cmdAddLine("ws bt gnss gnssraw");
+        cmdAddLine("ws wifi bt gnss gnssraw");
         cmdAddLine("date s/status h/help");
         cmdAddLine("<name> runs /name.x shortcut");
     } else {
