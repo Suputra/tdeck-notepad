@@ -26,4 +26,7 @@
 #define BOARD_GPS_RXD       44
 #define BOARD_GPS_PPS       1
 
+#define BOARD_TOUCH_INT     12
+#define BOARD_TOUCH_RST     45
+
 #define BOARD_BOOT_PIN      0

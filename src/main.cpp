@@ -84,6 +84,47 @@ GxEPD2_BW<GxEPD2_310_GDEQ031T10, GxEPD2_310_GDEQ031T10::HEIGHT> display(
 
 Adafruit_TCA8418 keypad;
 
+// --- Touch (CST226SE direct I2C) ---
+
+static bool touch_available = false;
+static uint8_t touch_i2c_addr = 0x1A;  // Will be auto-detected (0x1A or 0x5A)
+
+// Touch scroll state machine
+enum TouchState { TOUCH_IDLE, TOUCH_ACTIVE };
+static TouchState touch_state = TOUCH_IDLE;
+static int16_t touch_start_y = 0;
+static unsigned long last_touch_poll = 0;
+static constexpr unsigned long TOUCH_POLL_INTERVAL_MS = 50;
+static constexpr int16_t TOUCH_SCROLL_THRESHOLD = 16; // 2 text lines worth of pixels
+
+// Read 7 bytes from CST226SE register 0xD000 (touch data report)
+// Returns: 1=touched (y set), 0=not touched, -1=I2C failure
+static int cst226ReadTouch(int16_t* y) {
+    // Write 2-byte register address 0xD000
+    Wire.beginTransmission(touch_i2c_addr);
+    Wire.write((uint8_t)0xD0);
+    Wire.write((uint8_t)0x00);
+    if (Wire.endTransmission() != 0) return -1;
+
+    Wire.requestFrom(touch_i2c_addr, (uint8_t)7);
+    if (Wire.available() < 7) {
+        while (Wire.available()) Wire.read();
+        return -1;
+    }
+
+    uint8_t data[7];
+    for (int i = 0; i < 7; i++) data[i] = Wire.read();
+
+    // data[0]: finger1 ID/state (state in low nibble, 0x06 = pressed)
+    // data[1]: X high 8 bits, data[2]: Y high 8 bits
+    // data[3]: X low 4 | Y low 4, data[4]: pressure
+    bool touched = ((data[0] & 0x0F) == 0x06);
+    if (touched && y) {
+        *y = (int16_t)((data[2] << 4) | (data[3] & 0x0F));
+    }
+    return touched ? 1 : 0;
+}
+
 // --- App Mode ---
 
 enum AppMode { MODE_NOTEPAD, MODE_TERMINAL, MODE_COMMAND };
@@ -1384,6 +1425,7 @@ void setup() {
     gpio_hold_dis((gpio_num_t)BOARD_LORA_RST);
     gpio_hold_dis((gpio_num_t)BOARD_SD_CS);
     gpio_hold_dis((gpio_num_t)BOARD_EPD_CS);
+    gpio_hold_dis((gpio_num_t)BOARD_TOUCH_RST);
     gpio_deep_sleep_hold_dis();
 
     // BOOT is GPIO0 (active-low). Hold to trigger the same deep sleep path as "off".
@@ -1395,7 +1437,8 @@ void setup() {
     // Disable unused peripherals
     pinMode(BOARD_LORA_EN, OUTPUT);        digitalWrite(BOARD_LORA_EN, LOW);
     pinMode(BOARD_GPS_EN, OUTPUT);         digitalWrite(BOARD_GPS_EN, LOW);
-    pinMode(BOARD_1V8_EN, OUTPUT);         digitalWrite(BOARD_1V8_EN, LOW);
+    // Enable 1.8V rail early (powers touch controller)
+    pinMode(BOARD_1V8_EN, OUTPUT);         digitalWrite(BOARD_1V8_EN, HIGH);
     // Keyboard backlight off
     pinMode(BOARD_KEYBOARD_LED, OUTPUT);
     digitalWrite(BOARD_KEYBOARD_LED, LOW);
@@ -1406,8 +1449,27 @@ void setup() {
     pinMode(BOARD_SD_CS, OUTPUT);    digitalWrite(BOARD_SD_CS, HIGH);
     pinMode(BOARD_EPD_CS, OUTPUT);   digitalWrite(BOARD_EPD_CS, HIGH);
 
-    // Init I2C
+    // Hardware-reset touch controller BEFORE Wire.begin() so we don't
+    // need to reinitialize I2C later (which would break TCA8418).
+    // GPIO 45 is a strapping pin — toggle it before I2C is active.
+    {
+        gpio_config_t io_conf = {};
+        io_conf.intr_type = GPIO_INTR_DISABLE;
+        io_conf.mode = GPIO_MODE_OUTPUT;
+        io_conf.pin_bit_mask = (1ULL << BOARD_TOUCH_RST);
+        io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+        io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+        gpio_config(&io_conf);
+    }
+    gpio_set_level((gpio_num_t)BOARD_TOUCH_RST, 0);
+    delay(10);
+    gpio_set_level((gpio_num_t)BOARD_TOUCH_RST, 1);
+    delay(50);  // Wait for CST328 firmware to boot
+    pinMode(BOARD_TOUCH_INT, INPUT_PULLUP);
+
+    // Init I2C (after touch reset so GPIO 45 is stable)
     Wire.begin(BOARD_I2C_SDA, BOARD_I2C_SCL);
+    Wire.setClock(200000);
 
     // Init keyboard
     if (!keypad.begin(0x34, &Wire)) {
@@ -1416,6 +1478,50 @@ void setup() {
         keypad.matrix(KEYPAD_ROWS, KEYPAD_COLS);
         keypad.flush();
         SERIAL_LOGLN("Keyboard OK");
+    }
+
+    // Init touch controller (CST328 at 0x1A)
+    touch_available = false;
+    Wire.beginTransmission(0x1A);
+    uint8_t touch_ack = Wire.endTransmission();
+    SERIAL_LOGF("Touch probe 0x1A: %d\n", touch_ack);
+
+    if (touch_ack == 0) {
+        touch_i2c_addr = 0x1A;
+
+        // Enter command mode and read chip info
+        Wire.beginTransmission(0x1A);
+        Wire.write((uint8_t)0xD1);
+        Wire.write((uint8_t)0x01);
+        Wire.endTransmission();
+        delay(10);
+
+        Wire.beginTransmission(0x1A);
+        Wire.write((uint8_t)0xD1);
+        Wire.write((uint8_t)0xF4);
+        if (Wire.endTransmission() == 0) {
+            Wire.requestFrom((uint8_t)0x1A, (uint8_t)28);
+            int avail = Wire.available();
+            uint8_t buf[28] = {0};
+            for (int i = 0; i < 28 && Wire.available(); i++) buf[i] = Wire.read();
+            while (Wire.available()) Wire.read();
+            if (avail >= 8) {
+                SERIAL_LOGF("Touch: TX=%d RX=%d resX=%d resY=%d\n",
+                    buf[0], buf[2], buf[4] | (buf[5] << 8), buf[6] | (buf[7] << 8));
+            }
+        }
+
+        // Exit command mode → normal touch reporting
+        Wire.beginTransmission(0x1A);
+        Wire.write((uint8_t)0xD1);
+        Wire.write((uint8_t)0x09);
+        Wire.endTransmission();
+        delay(5);
+
+        touch_available = true;
+        SERIAL_LOGLN("Touch OK");
+    } else {
+        SERIAL_LOGLN("Touch not found at 0x1A");
     }
 
     // Init SPI & e-paper
@@ -1515,6 +1621,54 @@ void loop() {
             app_mode = MODE_COMMAND;
             xSemaphoreGive(state_mutex);
             render_requested = true;
+        }
+    }
+
+    // --- Touch scroll polling ---
+    if (touch_available && (millis() - last_touch_poll >= TOUCH_POLL_INTERVAL_MS)) {
+        last_touch_poll = millis();
+        int16_t cur_y = 0;
+        int touch_result = cst226ReadTouch(&cur_y);
+        bool is_touched = (touch_result == 1);
+
+        if (is_touched) {
+            if (touch_state == TOUCH_IDLE) {
+                // Touch just started
+                touch_state = TOUCH_ACTIVE;
+                touch_start_y = cur_y;
+            } else {
+                // Continuing touch — check for scroll gesture
+                int16_t delta_y = cur_y - touch_start_y;
+                if (delta_y > TOUCH_SCROLL_THRESHOLD || delta_y < -TOUCH_SCROLL_THRESHOLD) {
+                    int lines_delta = delta_y / CHAR_H;
+                    if (lines_delta != 0) {
+                        if (xSemaphoreTake(state_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                            AppMode mode = app_mode;
+                            if (mode == MODE_NOTEPAD) {
+                                // Natural scroll: finger down = see earlier content (scroll_line decreases)
+                                LayoutInfo li = computeLayoutFrom(text_buf, text_len, cursor_pos);
+                                int max_scroll = li.total_lines > ROWS_PER_SCREEN
+                                    ? li.total_lines - ROWS_PER_SCREEN : 0;
+                                scroll_line -= lines_delta;
+                                if (scroll_line < 0) scroll_line = 0;
+                                if (scroll_line > max_scroll) scroll_line = max_scroll;
+                                render_requested = true;
+                            } else if (mode == MODE_TERMINAL) {
+                                int max_scroll = term_line_count > ROWS_PER_SCREEN
+                                    ? term_line_count - ROWS_PER_SCREEN : 0;
+                                term_scroll -= lines_delta;
+                                if (term_scroll < 0) term_scroll = 0;
+                                if (term_scroll > max_scroll) term_scroll = max_scroll;
+                                term_render_requested = true;
+                            }
+                            xSemaphoreGive(state_mutex);
+                        }
+                        touch_start_y = cur_y;
+                    }
+                }
+            }
+        } else {
+            touch_state = TOUCH_IDLE;
         }
     }
 

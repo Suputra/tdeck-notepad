@@ -194,7 +194,7 @@ static char* agentTrim(char* s) {
 
 static void agentReportStateLocked() {
     Serial.printf(
-        "AGENT OK STATE mode=%s text_len=%d cursor=%d scroll=%d cmd_len=%d wifi=%d ssh=%d bt=%s heap=%d up=%d/%d up_run=%d down=%d/%d down_run=%d\n",
+        "AGENT OK STATE mode=%s text_len=%d cursor=%d scroll=%d cmd_len=%d wifi=%d ssh=%d bt=%s touch=%d heap=%d up=%d/%d up_run=%d down=%d/%d down_run=%d\n",
         agentModeName(app_mode),
         text_len,
         cursor_pos,
@@ -203,6 +203,7 @@ static void agentReportStateLocked() {
         (int)wifi_state,
         ssh_connected ? 1 : 0,
         btStatusShort(),
+        touch_available ? 1 : 0,
         ESP.getFreeHeap(),
         upload_done_count,
         upload_total_count,
@@ -238,6 +239,44 @@ static void agentRunCommand(char* line) {
     }
     if (strcasecmp(p, "HELP") == 0) {
         agentReplyOk("commands=PING HELP STATE RESULT TRACE TERMDBG TERMSNAP TERMHEX TERMRANGE KEY PRESS TEXT CMD WAIT RENDER BOOTOFF");
+        return;
+    }
+
+    if (strcasecmp(p, "TOUCH") == 0) {
+        // Try reading touch data at configured address
+        uint8_t addr = touch_i2c_addr;
+        Wire.beginTransmission(addr);
+        uint8_t ack = Wire.endTransmission();
+        if (ack != 0) {
+            agentReplyOk("TOUCH addr=0x%02X ack_err=%d avail=%d",
+                addr, ack, touch_available ? 1 : 0);
+            return;
+        }
+        Wire.beginTransmission(addr);
+        Wire.write((uint8_t)0xD0);
+        Wire.write((uint8_t)0x00);
+        uint8_t werr = Wire.endTransmission();
+        uint8_t raw[7] = {0};
+        int avail = 0;
+        if (werr == 0) {
+            Wire.requestFrom(addr, (uint8_t)7);
+            avail = Wire.available();
+            for (int i = 0; i < 7 && Wire.available(); i++) raw[i] = Wire.read();
+        }
+        agentReplyOk("TOUCH addr=0x%02X werr=%d avail=%d raw=%02X %02X %02X %02X %02X %02X %02X",
+            addr, werr, avail, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6]);
+        return;
+    }
+
+    if (strcasecmp(p, "I2CSCAN") == 0) {
+        Serial.print("AGENT OK I2C:");
+        for (uint8_t addr = 1; addr < 127; addr++) {
+            Wire.beginTransmission(addr);
+            if (Wire.endTransmission() == 0) {
+                Serial.printf(" 0x%02X", addr);
+            }
+        }
+        Serial.println();
         return;
     }
 

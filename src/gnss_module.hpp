@@ -282,8 +282,8 @@ void gnssInit() {
     gnss_gga_fix = false;
     gnss_uart_started = false;
     gnss_line_len = 0;
-    pinMode(BOARD_1V8_EN, OUTPUT);
-    digitalWrite(BOARD_1V8_EN, LOW);
+    // Note: BOARD_1V8_EN is shared with touch controller — keep it on.
+    // Only control GPS_EN for GPS power.
     pinMode(BOARD_GPS_EN, OUTPUT);
     digitalWrite(BOARD_GPS_EN, LOW);
 }
@@ -310,7 +310,7 @@ bool gnssSetPower(bool on) {
         gnss_uart_started = false;
     }
     digitalWrite(BOARD_GPS_EN, LOW);
-    digitalWrite(BOARD_1V8_EN, LOW);
+    // Note: Keep BOARD_1V8_EN on — shared with touch controller
     gnss_state.power_on = false;
     gnss_rmc_fix = false;
     gnss_gga_fix = false;
