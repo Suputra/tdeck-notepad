@@ -1216,6 +1216,9 @@ void wifiScanCommand() {
             wifi_state = WIFI_CONNECTED;
             wifiClearLastFailure();
             cmdAddLine("WiFi: %s", WiFi.localIP().toString().c_str());
+            cmdAddLine("Clock: NTP sync...");
+            if (wifiSyncClockNtp()) cmdAddLine("Clock: NTP synced");
+            else cmdAddLine("Clock: NTP failed");
             break;
         } else {
             char reason[48];
@@ -1230,6 +1233,9 @@ void wifiScanCommand() {
         if (WiFi.status() == WL_CONNECTED) {
             wifi_state = WIFI_CONNECTED;
             cmdAddLine("WiFi: %s", WiFi.SSID().c_str());
+            cmdAddLine("Clock: NTP sync...");
+            if (wifiSyncClockNtp()) cmdAddLine("Clock: NTP synced");
+            else cmdAddLine("Clock: NTP failed");
         } else {
             wifi_state = WIFI_FAILED;
             if (!tried_known) {
@@ -1335,6 +1341,15 @@ void dailyOpenCommand() {
         cmdSetResult("Daily new %s", name);
     }
     app_mode = MODE_NOTEPAD;
+}
+
+void clockDateCommand() {
+    char stamp[40];
+    if (!timeSyncFormatLocal(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S %Z")) {
+        cmdSetResult("Clock unset; gpson/WiFi");
+        return;
+    }
+    cmdSetResult("%s (%s)", stamp, timeSyncSourceName(time_sync_source));
 }
 
 bool executeCommand(const char* cmd) {
@@ -1475,6 +1490,8 @@ bool executeCommand(const char* cmd) {
         else cmdSetResult("GNSS already off");
     } else if (strcmp(word, "gnssraw") == 0 || strcmp(word, "gpsraw") == 0) {
         gnssRawCommand();
+    } else if (strcmp(word, "date") == 0 || strcmp(word, "time") == 0 || strcmp(word, "now") == 0) {
+        clockDateCommand();
     } else if (strcmp(word, "s") == 0 || strcmp(word, "status") == 0) {
         const char* ws = "off";
         if (wifi_state == WIFI_CONNECTED) ws = "ok";
@@ -1506,6 +1523,7 @@ bool executeCommand(const char* cmd) {
         cmdAddLine("daily (r)m (u)pload (d)ownload");
         cmdAddLine("(p)aste ssh (np)ad dc (ws)/scan");
         cmdAddLine("bt(toggle) gps gpson gpsoff gpsraw");
+        cmdAddLine("date/time/now");
         cmdAddLine("<name> runs /name.x shortcut");
         cmdAddLine("re(f)resh (s)tatus off (h)elp");
     } else {

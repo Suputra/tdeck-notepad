@@ -136,15 +136,29 @@ void timeSyncMarkNtp() {
     timeSyncRecord(TIME_SYNC_NTP);
 }
 
-bool timeSyncMakeDailyFilename(char* out, size_t out_len) {
-    if (!out || out_len < 14) return false; // YYYY-MM-DD.md + NUL
+bool timeSyncGetLocalTm(struct tm* out_tm) {
+    if (!out_tm) return false;
     time_t now = time(NULL);
     if (now <= 0 || !timeSyncClockLooksValid()) return false;
+    localtime_r(&now, out_tm);
+    return true;
+}
+
+bool timeSyncFormatLocal(char* out, size_t out_len, const char* fmt) {
+    if (!out || out_len < 2 || !fmt || fmt[0] == '\0') return false;
     struct tm tm_local = {};
-    localtime_r(&now, &tm_local);
-    int n = snprintf(out, out_len, "%04d-%02d-%02d.md",
-                     tm_local.tm_year + 1900,
-                     tm_local.tm_mon + 1,
-                     tm_local.tm_mday);
+    if (!timeSyncGetLocalTm(&tm_local)) return false;
+    return strftime(out, out_len, fmt, &tm_local) > 0;
+}
+
+bool timeSyncFormatLocalDate(char* out, size_t out_len) {
+    return timeSyncFormatLocal(out, out_len, "%Y-%m-%d");
+}
+
+bool timeSyncMakeDailyFilename(char* out, size_t out_len) {
+    if (!out || out_len < 14) return false; // YYYY-MM-DD.md + NUL
+    char date[11];
+    if (!timeSyncFormatLocalDate(date, sizeof(date))) return false;
+    int n = snprintf(out, out_len, "%s.md", date);
     return n > 0 && (size_t)n < out_len;
 }

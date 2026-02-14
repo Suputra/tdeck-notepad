@@ -6,6 +6,26 @@ struct WiFiAttemptResult {
     bool timed_out;
 };
 
+static constexpr const char* WIFI_NTP_SERVER_PRIMARY = "pool.ntp.org";
+static constexpr const char* WIFI_NTP_SERVER_SECONDARY = "time.google.com";
+static constexpr uint8_t WIFI_NTP_SYNC_TRIES = 10;
+static constexpr uint32_t WIFI_NTP_SYNC_RETRY_MS = 250;
+
+bool wifiSyncClockNtp() {
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    configTime(0, 0, WIFI_NTP_SERVER_PRIMARY, WIFI_NTP_SERVER_SECONDARY);
+    struct tm tm = {};
+    for (uint8_t i = 0; i < WIFI_NTP_SYNC_TRIES; i++) {
+        if (getLocalTime(&tm, WIFI_NTP_SYNC_RETRY_MS)) {
+            timeSyncMarkNtp();
+            return true;
+        }
+        delay(WIFI_NTP_SYNC_RETRY_MS);
+    }
+    return false;
+}
+
 const char* wifiStatusReason(wl_status_t status) {
     switch (status) {
         case WL_NO_SSID_AVAIL:   return "SSID not found";
@@ -77,6 +97,8 @@ void wifiCheck() {
         if (WiFi.status() == WL_CONNECTED) {
             wifi_state = WIFI_CONNECTED;
             Serial.printf("WiFi: connected to %s, IP=%s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+            if (wifiSyncClockNtp()) Serial.println("Clock: NTP synced");
+            else Serial.println("Clock: NTP sync failed");
         }
     } else if (wifi_state == WIFI_CONNECTED) {
         if (WiFi.status() != WL_CONNECTED) {
@@ -138,16 +160,11 @@ bool vpnConnect(bool force_reinit) {
         return false;
     }
     connectMsg("VPN: NTP sync...");
-    configTime(0, 0, "pool.ntp.org", "time.google.com");
-    struct tm tm;
-    int tries = 0;
-    while (!getLocalTime(&tm) && tries++ < 10) delay(500);
-    if (tries >= 10) {
+    if (!wifiSyncClockNtp()) {
         vpn_connected = false;
         connectMsg("VPN: NTP failed");
         return false;
     }
-    timeSyncMarkNtp();
     connectMsg("VPN: connecting...");
     IPAddress local_ip;
     if (!local_ip.fromString(config_vpn_ip)) {
@@ -404,6 +421,9 @@ void sshConnectTask(void* param) {
         if (connected) {
             wifi_state = WIFI_CONNECTED;
             connectMsg("WiFi: %s (%s)", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+            connectMsg("Clock: NTP sync...");
+            if (wifiSyncClockNtp()) connectMsg("Clock: NTP synced");
+            else connectMsg("Clock: NTP failed");
         } else {
             wifi_state = WIFI_FAILED;
             connectMsg("WiFi: all failed");
