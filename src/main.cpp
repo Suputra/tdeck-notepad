@@ -94,8 +94,9 @@ enum TouchState { TOUCH_IDLE, TOUCH_ACTIVE };
 static TouchState touch_state = TOUCH_IDLE;
 static int16_t touch_start_y = 0;
 static unsigned long last_touch_poll = 0;
-static constexpr unsigned long TOUCH_POLL_INTERVAL_MS = 50;
+static constexpr unsigned long TOUCH_POLL_INTERVAL_MS = 90;
 static constexpr int16_t TOUCH_SCROLL_THRESHOLD = 16; // 2 text lines worth of pixels
+static constexpr int TOUCH_SCROLL_MAX_STEPS_PER_POLL = 3;
 
 // Read 7 bytes from CST226SE register 0xD000 (touch data report)
 // Returns: 1=touched (y set), 0=not touched, -1=I2C failure
@@ -149,6 +150,8 @@ static String current_file = "";
 static bool file_modified = false;
 
 static SemaphoreHandle_t state_mutex;
+// Protects libssh channel I/O across cores (receive task vs input writers).
+static SemaphoreHandle_t ssh_io_mutex;
 static volatile bool render_requested = false;
 static volatile bool poweroff_requested = false;
 static unsigned long boot_pressed_since = 0;
@@ -200,6 +203,9 @@ static int  csi_params[MAX_CSI_PARAMS];
 static int  csi_param_count = 0;
 static bool csi_parsing_num = false;
 static bool csi_private = false;      // '?' seen in CSI params
+// Mouse reporting modes requested by remote terminal app (DECSET private modes).
+static uint8_t term_mouse_tracking_mode_mask = 0; // ?1000/?1002/?1003
+static bool term_mouse_sgr_mode = false;          // ?1006
 
 // Scroll region (0-based screen rows)
 static int scroll_region_top = 0;
@@ -355,6 +361,15 @@ LayoutInfo computeLayoutFrom(const char* buf, int len, int cpos) {
 
 // --- Terminal Buffer Operations ---
 
+static uint8_t termMouseTrackingModeBit(int mode) {
+    switch (mode) {
+        case 1000: return 0x01; // button-event tracking
+        case 1002: return 0x02; // button-motion tracking
+        case 1003: return 0x04; // any-motion tracking
+        default:   return 0x00;
+    }
+}
+
 void terminalClear() {
     for (int i = 0; i < TERM_ROWS; i++) {
         memset(term_buf[i], ' ', TERM_COLS);
@@ -369,6 +384,8 @@ void terminalClear() {
     csi_param_count = 0;
     csi_parsing_num = false;
     csi_private = false;
+    term_mouse_tracking_mode_mask = 0;
+    term_mouse_sgr_mode = false;
     scroll_region_top = 0;
     scroll_region_bot = ROWS_PER_SCREEN - 1;
     scroll_region_set = false;
@@ -500,6 +517,14 @@ void handleCSI(char final_char) {
                     case 25:   // Show cursor
                         cursor_visible = true;
                         break;
+                    case 1000:
+                    case 1002:
+                    case 1003:
+                        term_mouse_tracking_mode_mask |= termMouseTrackingModeBit(csi_params[pi]);
+                        break;
+                    case 1006:
+                        term_mouse_sgr_mode = true;
+                        break;
                 }
             }
         } else if (final_char == 'l') {
@@ -517,6 +542,14 @@ void handleCSI(char final_char) {
                         break;
                     case 25:   // Hide cursor
                         cursor_visible = false;
+                        break;
+                    case 1000:
+                    case 1002:
+                    case 1003:
+                        term_mouse_tracking_mode_mask &= (uint8_t)~termMouseTrackingModeBit(csi_params[pi]);
+                        break;
+                    case 1006:
+                        term_mouse_sgr_mode = false;
                         break;
                 }
             }
@@ -1408,6 +1441,41 @@ void autoSaveDirty() {
 
 // --- Setup & Loop ---
 
+static bool terminalMouseTrackingEnabled() {
+    return term_mouse_tracking_mode_mask != 0;
+}
+
+static void terminalSendMouseWheel(bool wheel_up) {
+    // Use cursor location as event location so tmux can route wheel to active pane.
+    int col = term_cursor_col;
+    if (col < 0) col = 0;
+    if (col >= TERM_COLS) col = TERM_COLS - 1;
+    int x = col + 1; // 1-based
+
+    int row = term_cursor_row - term_scroll;
+    if (row < 0) row = 0;
+    if (row >= ROWS_PER_SCREEN) row = ROWS_PER_SCREEN - 1;
+    int y = row + 1; // 1-based
+
+    if (term_mouse_sgr_mode) {
+        char seq[32];
+        int cb = wheel_up ? 64 : 65;
+        int n = snprintf(seq, sizeof(seq), "\x1b[<%d;%d;%dM", cb, x, y);
+        if (n > 0) sshSendString(seq, n);
+        return;
+    }
+
+    // Legacy X10 protocol: ESC [ M Cb Cx Cy (each byte offset by 32).
+    char seq[6];
+    seq[0] = 0x1B;
+    seq[1] = '[';
+    seq[2] = 'M';
+    seq[3] = (char)(32 + (wheel_up ? 64 : 65));
+    seq[4] = (char)(32 + x);
+    seq[5] = (char)(32 + y);
+    sshSendString(seq, 6);
+}
+
 void setup() {
     SERIAL_LOG_BEGIN(115200);
 #if TDECK_AGENT_DEBUG
@@ -1546,6 +1614,7 @@ void setup() {
 
     // Create mutex
     state_mutex = xSemaphoreCreateMutex();
+    ssh_io_mutex = xSemaphoreCreateMutex();
 
     // Launch display task on core 0 (Arduino loop runs on core 1)
     xTaskCreatePinnedToCore(
@@ -1654,12 +1723,31 @@ void loop() {
                                 if (scroll_line > max_scroll) scroll_line = max_scroll;
                                 render_requested = true;
                             } else if (mode == MODE_TERMINAL) {
-                                int max_scroll = term_line_count > ROWS_PER_SCREEN
-                                    ? term_line_count - ROWS_PER_SCREEN : 0;
-                                term_scroll -= lines_delta;
-                                if (term_scroll < 0) term_scroll = 0;
-                                if (term_scroll > max_scroll) term_scroll = max_scroll;
-                                term_render_requested = true;
+                                if (terminalMouseTrackingEnabled()) {
+                                    int steps = lines_delta;
+                                    if (steps > TOUCH_SCROLL_MAX_STEPS_PER_POLL) {
+                                        steps = TOUCH_SCROLL_MAX_STEPS_PER_POLL;
+                                    }
+                                    if (steps < -TOUCH_SCROLL_MAX_STEPS_PER_POLL) {
+                                        steps = -TOUCH_SCROLL_MAX_STEPS_PER_POLL;
+                                    }
+                                    if (steps > 0) {
+                                        for (int i = 0; i < steps; i++) {
+                                            terminalSendMouseWheel(true);
+                                        }
+                                    } else {
+                                        for (int i = 0; i < -steps; i++) {
+                                            terminalSendMouseWheel(false);
+                                        }
+                                    }
+                                } else {
+                                    int max_scroll = term_line_count > ROWS_PER_SCREEN
+                                        ? term_line_count - ROWS_PER_SCREEN : 0;
+                                    term_scroll -= lines_delta;
+                                    if (term_scroll < 0) term_scroll = 0;
+                                    if (term_scroll > max_scroll) term_scroll = max_scroll;
+                                    term_render_requested = true;
+                                }
                             }
                             xSemaphoreGive(state_mutex);
                         }

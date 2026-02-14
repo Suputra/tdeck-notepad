@@ -112,6 +112,15 @@ void wifiCheck() {
 
 // --- SSH ---
 
+static bool sshIOLock(TickType_t timeout_ticks = pdMS_TO_TICKS(20)) {
+    if (!ssh_io_mutex) return true;
+    return xSemaphoreTake(ssh_io_mutex, timeout_ticks) == pdTRUE;
+}
+
+static void sshIOUnlock() {
+    if (ssh_io_mutex) xSemaphoreGive(ssh_io_mutex);
+}
+
 void sshDisconnect() {
     if (ssh_recv_task_handle) {
         vTaskDelete(ssh_recv_task_handle);
@@ -468,12 +477,27 @@ void sshConnectAsync() {
 
 void sshSendKey(char c) {
     if (!ssh_connected || !ssh_chan) return;
-    ssh_channel_write(ssh_chan, &c, 1);
+    if (!sshIOLock()) return;
+    int wrote = ssh_channel_write(ssh_chan, &c, 1);
+    sshIOUnlock();
+    if (wrote != 1) {
+        SERIAL_LOGF("SSH: key write failed (%d)\n", wrote);
+    }
 }
 
 void sshSendString(const char* s, int len) {
-    if (!ssh_connected || !ssh_chan) return;
-    ssh_channel_write(ssh_chan, s, len);
+    if (!ssh_connected || !ssh_chan || !s || len <= 0) return;
+    if (!sshIOLock()) return;
+    int sent = 0;
+    while (sent < len) {
+        int wrote = ssh_channel_write(ssh_chan, s + sent, len - sent);
+        if (wrote <= 0) {
+            SERIAL_LOGF("SSH: string write failed (%d)\n", wrote);
+            break;
+        }
+        sent += wrote;
+    }
+    sshIOUnlock();
 }
 
 void sshReceiveTask(void* param) {
@@ -484,21 +508,36 @@ void sshReceiveTask(void* param) {
             continue;
         }
 
+        if (!sshIOLock()) {
+            vTaskDelay(pdMS_TO_TICKS(2));
+            continue;
+        }
         int nbytes = ssh_channel_read_nonblocking(ssh_chan, recv_buf, sizeof(recv_buf), 0);
+        sshIOUnlock();
         if (nbytes > 0) {
             xSemaphoreTake(state_mutex, portMAX_DELAY);
             terminalAppendOutput(recv_buf, nbytes);
             // Drain loop: keep reading to accumulate data before rendering
             int total = nbytes;
             for (int drain = 0; drain < 10 && total < 2048; drain++) {
+                if (!sshIOLock()) break;
                 nbytes = ssh_channel_read_nonblocking(ssh_chan, recv_buf, sizeof(recv_buf), 0);
+                sshIOUnlock();
                 if (nbytes <= 0) break;
                 terminalAppendOutput(recv_buf, nbytes);
                 total += nbytes;
             }
             xSemaphoreGive(state_mutex);
             term_render_requested = true;
-        } else if (nbytes == SSH_ERROR || ssh_channel_is_eof(ssh_chan)) {
+        } else {
+            bool eof = false;
+            if (nbytes != SSH_ERROR) {
+                if (sshIOLock()) {
+                    eof = ssh_channel_is_eof(ssh_chan);
+                    sshIOUnlock();
+                }
+            }
+            if (nbytes == SSH_ERROR || eof) {
             SERIAL_LOGLN("SSH: channel closed by remote");
             ssh_connected = false;
 
@@ -511,8 +550,9 @@ void sshReceiveTask(void* param) {
             partial_count = 100;  // force a full clean redraw on next terminal render
             term_render_requested = true;
             vTaskDelay(pdMS_TO_TICKS(1000));
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(5));
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(5));
+            }
         }
     }
 }
