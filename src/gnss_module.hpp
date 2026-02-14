@@ -240,7 +240,7 @@ void gnssHandleSentence(const char* sentence) {
     }
 
     if (timeSyncMaybeFromGnss(gnss_state.utc_time, gnss_state.utc_date, gnss_state.has_fix)) {
-        Serial.println("Clock: synced from GNSS");
+        SERIAL_LOGLN("Clock: synced from GNSS");
     }
 
     gnss_state.last_rx_ms = millis();
@@ -300,7 +300,7 @@ bool gnssSetPower(bool on) {
         gnss_state.power_on = true;
         gnssResetSessionData();
         gnss_state.power_on = true;
-        Serial.println("GNSS: powered on");
+        SERIAL_LOGLN("GNSS: powered on");
         return true;
     }
 
@@ -316,7 +316,7 @@ bool gnssSetPower(bool on) {
     gnss_gga_fix = false;
     gnssUpdateFixFlag();
     gnss_line_len = 0;
-    Serial.println("GNSS: powered off");
+    SERIAL_LOGLN("GNSS: powered off");
     return true;
 }
 

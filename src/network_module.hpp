@@ -98,14 +98,14 @@ void wifiCheck() {
     if (wifi_state == WIFI_CONNECTING) {
         if (WiFi.status() == WL_CONNECTED) {
             wifi_state = WIFI_CONNECTED;
-            Serial.printf("WiFi: connected to %s, IP=%s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
-            if (wifiSyncClockNtp()) Serial.println("Clock: NTP synced");
-            else Serial.println("Clock: NTP sync failed");
+            SERIAL_LOGF("WiFi: connected to %s, IP=%s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+            if (wifiSyncClockNtp()) SERIAL_LOGLN("Clock: NTP synced");
+            else SERIAL_LOGLN("Clock: NTP sync failed");
         }
     } else if (wifi_state == WIFI_CONNECTED) {
         if (WiFi.status() != WL_CONNECTED) {
             wifi_state = WIFI_FAILED;
-            Serial.println("WiFi: connection lost");
+            SERIAL_LOGLN("WiFi: connection lost");
         }
     }
 }
@@ -129,7 +129,7 @@ void sshDisconnect() {
         ssh_sess = NULL;
     }
     ssh_last_host[0] = '\0';
-    Serial.println("SSH: disconnected");
+    SERIAL_LOGLN("SSH: disconnected");
 }
 
 void sshReceiveTask(void* param);
@@ -201,7 +201,7 @@ bool sshTryConnect(const char* host) {
         connectMsg("SSH: missing host");
         return false;
     }
-    Serial.printf("SSH: connecting to %s:%d...\n", host, config_ssh_port);
+    SERIAL_LOGF("SSH: connecting to %s:%d...\n", host, config_ssh_port);
 
     ssh_sess = ssh_new();
     if (!ssh_sess) return false;
@@ -215,7 +215,7 @@ bool sshTryConnect(const char* host) {
 
     if (ssh_connect(ssh_sess) != SSH_OK) {
         const char* err = ssh_get_error(ssh_sess);
-        Serial.printf("SSH: connect failed: %s\n", err ? err : "(unknown)");
+        SERIAL_LOGF("SSH: connect failed: %s\n", err ? err : "(unknown)");
         if (err && strstr(err, "resolve hostname")) {
             connectMsg("SSH: DNS fail %s", host);
         }
@@ -225,7 +225,7 @@ bool sshTryConnect(const char* host) {
     }
 
     if (ssh_userauth_password(ssh_sess, NULL, config_ssh_pass) != SSH_AUTH_SUCCESS) {
-        Serial.printf("SSH: auth failed: %s\n", ssh_get_error(ssh_sess));
+        SERIAL_LOGF("SSH: auth failed: %s\n", ssh_get_error(ssh_sess));
         ssh_disconnect(ssh_sess);
         ssh_free(ssh_sess);
         ssh_sess = NULL;
@@ -236,11 +236,11 @@ bool sshTryConnect(const char* host) {
 
 bool sshConnect() {
     if (!hasNetwork()) {
-        Serial.println("SSH: no network");
+        SERIAL_LOGLN("SSH: no network");
         return false;
     }
     if (ssh_connected) {
-        Serial.println("SSH: already connected");
+        SERIAL_LOGLN("SSH: already connected");
         return false;
     }
 
@@ -311,7 +311,7 @@ bool sshConnect() {
 
     ssh_chan = ssh_channel_new(ssh_sess);
     if (!ssh_chan) {
-        Serial.println("SSH: channel_new failed");
+        SERIAL_LOGLN("SSH: channel_new failed");
         ssh_disconnect(ssh_sess);
         ssh_free(ssh_sess);
         ssh_sess = NULL;
@@ -320,7 +320,7 @@ bool sshConnect() {
     }
 
     if (ssh_channel_open_session(ssh_chan) != SSH_OK) {
-        Serial.printf("SSH: channel open failed: %s\n", ssh_get_error(ssh_sess));
+        SERIAL_LOGF("SSH: channel open failed: %s\n", ssh_get_error(ssh_sess));
         ssh_channel_free(ssh_chan);
         ssh_chan = NULL;
         ssh_disconnect(ssh_sess);
@@ -332,7 +332,7 @@ bool sshConnect() {
 
     // Request PTY sized to our screen
     if (ssh_channel_request_pty_size(ssh_chan, "xterm", TERM_COLS, ROWS_PER_SCREEN) != SSH_OK) {
-        Serial.printf("SSH: pty request failed: %s\n", ssh_get_error(ssh_sess));
+        SERIAL_LOGF("SSH: pty request failed: %s\n", ssh_get_error(ssh_sess));
         ssh_channel_close(ssh_chan);
         ssh_channel_free(ssh_chan);
         ssh_chan = NULL;
@@ -344,7 +344,7 @@ bool sshConnect() {
     }
 
     if (ssh_channel_request_shell(ssh_chan) != SSH_OK) {
-        Serial.printf("SSH: shell request failed: %s\n", ssh_get_error(ssh_sess));
+        SERIAL_LOGF("SSH: shell request failed: %s\n", ssh_get_error(ssh_sess));
         ssh_channel_close(ssh_chan);
         ssh_channel_free(ssh_chan);
         ssh_chan = NULL;
@@ -356,7 +356,7 @@ bool sshConnect() {
     }
 
     ssh_connected = true;
-    Serial.println("SSH: connected!");
+    SERIAL_LOGLN("SSH: connected!");
 
     // Clear terminal buffer for fresh session
     xSemaphoreTake(state_mutex, portMAX_DELAY);
@@ -499,7 +499,7 @@ void sshReceiveTask(void* param) {
             xSemaphoreGive(state_mutex);
             term_render_requested = true;
         } else if (nbytes == SSH_ERROR || ssh_channel_is_eof(ssh_chan)) {
-            Serial.println("SSH: channel closed by remote");
+            SERIAL_LOGLN("SSH: channel closed by remote");
             ssh_connected = false;
 
             // Reset parser/buffer immediately so stale TUI content does not linger.

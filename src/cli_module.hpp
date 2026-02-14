@@ -1344,8 +1344,8 @@ void gnssRawCommand() {
     if (snap.last_rmc[0] == '\0' && snap.last_gga[0] == '\0') cmdAddLine("No NMEA yet");
     cmdAddLine("USB serial has full lines");
 
-    if (snap.last_rmc[0] != '\0') Serial.printf("GNSS RMC %s\n", snap.last_rmc);
-    if (snap.last_gga[0] != '\0') Serial.printf("GNSS GGA %s\n", snap.last_gga);
+    if (snap.last_rmc[0] != '\0') SERIAL_LOGF("GNSS RMC %s\n", snap.last_rmc);
+    if (snap.last_gga[0] != '\0') SERIAL_LOGF("GNSS GGA %s\n", snap.last_gga);
 }
 
 void dailyOpenCommand() {

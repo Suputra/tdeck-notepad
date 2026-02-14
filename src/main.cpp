@@ -23,6 +23,18 @@
 #define TDECK_AGENT_DEBUG 0
 #endif
 
+#if TDECK_AGENT_DEBUG
+#define SERIAL_LOG_BEGIN(baud) Serial.begin(baud)
+#define SERIAL_LOGF(...) Serial.printf(__VA_ARGS__)
+#define SERIAL_LOG(...) Serial.print(__VA_ARGS__)
+#define SERIAL_LOGLN(...) Serial.println(__VA_ARGS__)
+#else
+#define SERIAL_LOG_BEGIN(baud) do { (void)(baud); } while (0)
+#define SERIAL_LOGF(...) do {} while (0)
+#define SERIAL_LOG(...) do {} while (0)
+#define SERIAL_LOGLN(...) do {} while (0)
+#endif
+
 // --- WiFi / SSH Config (loaded from SD /CONFIG) ---
 
 static WiFiAP config_wifi[MAX_WIFI_APS];
@@ -208,7 +220,7 @@ void terminalDebugTraceDump(int max_bytes) {
     if (n > max_bytes) n = max_bytes;
     int dropped = (int)term_trace_total - term_trace_count;
 
-    Serial.printf("AGENT OK TRACE enabled=%d bytes=%d total=%lu dropped=%d\n",
+    SERIAL_LOGF("AGENT OK TRACE enabled=%d bytes=%d total=%lu dropped=%d\n",
                   term_trace_enabled ? 1 : 0, n, (unsigned long)term_trace_total, dropped);
     if (n <= 0) return;
 
@@ -218,23 +230,23 @@ void terminalDebugTraceDump(int max_bytes) {
     for (int i = 0; i < n; i += 16) {
         int chunk = (n - i > 16) ? 16 : (n - i);
         int idx = (start + i) % TERM_TRACE_CAP;
-        Serial.printf("TRACEHEX %04d:", i);
+        SERIAL_LOGF("TRACEHEX %04d:", i);
         for (int j = 0; j < chunk; j++) {
             int pos = (idx + j) % TERM_TRACE_CAP;
-            Serial.printf(" %02X", term_trace_buf[pos]);
+            SERIAL_LOGF(" %02X", term_trace_buf[pos]);
         }
-        Serial.print(" |");
+        SERIAL_LOG(" |");
         for (int j = 0; j < chunk; j++) {
             int pos = (idx + j) % TERM_TRACE_CAP;
             uint8_t c = term_trace_buf[pos];
-            Serial.print((c >= 32 && c <= 126) ? (char)c : '.');
+            SERIAL_LOG((c >= 32 && c <= 126) ? (char)c : '.');
         }
-        Serial.println("|");
+        SERIAL_LOGLN("|");
     }
 }
 
 void terminalDebugStateDump() {
-    Serial.printf(
+    SERIAL_LOGF(
         "AGENT OK TERMDBG row=%d col=%d scroll=%d lines=%d wrap=%d esc=%d csi=%d priv=%d utf8_rem=%d utf8_cp=%lu alt=%d sr_top=%d sr_bot=%d sr_set=%d\n",
         term_cursor_row, term_cursor_col, term_scroll, term_line_count,
         term_wrap_pending ? 1 : 0,
@@ -911,17 +923,17 @@ void sdRelease() { sd_busy = false; }
 void sdInit() {
     if (SD.begin(BOARD_SD_CS, SPI, 4000000)) {
         sd_mounted = true;
-        Serial.printf("SD: mounted, size=%lluMB\n", SD.cardSize() / (1024 * 1024));
+        SERIAL_LOGF("SD: mounted, size=%lluMB\n", SD.cardSize() / (1024 * 1024));
     } else {
         sd_mounted = false;
-        Serial.println("SD: mount failed");
+        SERIAL_LOGLN("SD: mount failed");
     }
 }
 
 void sdLoadConfig() {
     if (!sd_mounted) return;
     File f = SD.open("/CONFIG", FILE_READ);
-    if (!f) { Serial.println("SD: no /CONFIG"); return; }
+    if (!f) { SERIAL_LOGLN("SD: no /CONFIG"); return; }
 
     // CONFIG format: section-based, # comments, blank lines skipped
     // # wifi — pairs of ssid/password (variable count)
@@ -940,7 +952,7 @@ void sdLoadConfig() {
         config_wifi[config_wifi_count].ssid[63] = '\0';
         strncpy(config_wifi[config_wifi_count].pass, pass, 63);
         config_wifi[config_wifi_count].pass[63] = '\0';
-        Serial.printf("SD: WiFi AP added: %s%s\n",
+        SERIAL_LOGF("SD: WiFi AP added: %s%s\n",
                       config_wifi[config_wifi_count].ssid,
                       config_wifi[config_wifi_count].pass[0] ? "" : " (open)");
         config_wifi_count++;
@@ -1090,7 +1102,7 @@ void sdLoadConfig() {
                 if (parseBtPasskey(line, &parsed)) {
                     config_bt_passkey = parsed;
                 } else {
-                    Serial.printf("SD: BT pin ignored (need 6 digits): %s\n", line.c_str());
+                    SERIAL_LOGF("SD: BT pin ignored (need 6 digits): %s\n", line.c_str());
                 }
                 field++;
                 continue;
@@ -1100,14 +1112,14 @@ void sdLoadConfig() {
             if (field == 0) {
                 strncpy(config_time_tz, line.c_str(), sizeof(config_time_tz) - 1);
                 config_time_tz[sizeof(config_time_tz) - 1] = '\0';
-                Serial.printf("SD: timezone set: %s\n", config_time_tz);
+                SERIAL_LOGF("SD: timezone set: %s\n", config_time_tz);
             }
             field++;
         }
     }
     flushPendingOpenWiFi();
     f.close();
-    Serial.printf("SD: config loaded (%d WiFi APs, host=%s, VPN=%s, BT=%s, BT name=%s, TZ=%s)\n",
+    SERIAL_LOGF("SD: config loaded (%d WiFi APs, host=%s, VPN=%s, BT=%s, BT name=%s, TZ=%s)\n",
                   config_wifi_count,
                   config_ssh_host,
                   vpnConfigured() ? "yes" : "no",
@@ -1356,9 +1368,11 @@ void autoSaveDirty() {
 // --- Setup & Loop ---
 
 void setup() {
-    Serial.begin(115200);
+    SERIAL_LOG_BEGIN(115200);
+#if TDECK_AGENT_DEBUG
     delay(500);
-    Serial.println("T-Deck Pro Notepad + Terminal starting...");
+#endif
+    SERIAL_LOGLN("T-Deck Pro Notepad + Terminal starting...");
     timeSyncInit();
 
     // Clear any GPIO deep-sleep holds from a prior power-off cycle.
@@ -1397,11 +1411,11 @@ void setup() {
 
     // Init keyboard
     if (!keypad.begin(0x34, &Wire)) {
-        Serial.println("ERROR: TCA8418 keyboard not found!");
+        SERIAL_LOGLN("ERROR: TCA8418 keyboard not found!");
     } else {
         keypad.matrix(KEYPAD_ROWS, KEYPAD_COLS);
         keypad.flush();
-        Serial.println("Keyboard OK");
+        SERIAL_LOGLN("Keyboard OK");
     }
 
     // Init SPI & e-paper
@@ -1438,8 +1452,8 @@ void setup() {
         0               // core 0
     );
 
-    Serial.println("Ready. Single-tap MIC for commands. Use `ssh` to open terminal.");
-    Serial.printf("Free heap: %d bytes\n", ESP.getFreeHeap());
+    SERIAL_LOGLN("Ready. Single-tap MIC for commands. Use `ssh` to open terminal.");
+    SERIAL_LOGF("Free heap: %d bytes\n", ESP.getFreeHeap());
 }
 
 // Core 1: keyboard polling — never blocks on display

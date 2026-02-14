@@ -111,18 +111,18 @@ class BtServerCallbacks : public BLEServerCallbacks {
         btSetStatusValue("connected");
         render_requested = true;
         term_render_requested = true;
-        Serial.println("BT: client connected");
+        SERIAL_LOGLN("BT: client connected");
     }
 
     void onConnect(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) override {
         onConnect(pServer);
         if (param) {
             btFormatAddr(param->connect.remote_bda, bt_peer_addr, sizeof(bt_peer_addr));
-            Serial.printf("BT: peer=%s\n", bt_peer_addr);
+            SERIAL_LOGF("BT: peer=%s\n", bt_peer_addr);
             esp_ble_sec_act_t sec_act = btPasskeyConfigured() ? ESP_BLE_SEC_ENCRYPT_MITM : ESP_BLE_SEC_ENCRYPT_NO_MITM;
             esp_err_t err = esp_ble_set_encryption(param->connect.remote_bda, sec_act);
             if (err != ESP_OK) {
-                Serial.printf("BT: set_encryption failed err=%d\n", (int)err);
+                SERIAL_LOGF("BT: set_encryption failed err=%d\n", (int)err);
             }
         }
     }
@@ -135,7 +135,7 @@ class BtServerCallbacks : public BLEServerCallbacks {
         btSetStatusValue("idle");
         render_requested = true;
         term_render_requested = true;
-        Serial.println("BT: client disconnected");
+        SERIAL_LOGLN("BT: client disconnected");
     }
 
     void onDisconnect(BLEServer* pServer, esp_ble_gatts_cb_param_t* param) override {
@@ -152,7 +152,7 @@ class BtSecurityCallbacks : public BLESecurityCallbacks {
     }
 
     void onPassKeyNotify(uint32_t pass_key) override {
-        Serial.printf("BT: passkey notify %06u\n", (unsigned)pass_key);
+        SERIAL_LOGF("BT: passkey notify %06u\n", (unsigned)pass_key);
     }
 
     bool onSecurityRequest() override {
@@ -163,16 +163,16 @@ class BtSecurityCallbacks : public BLESecurityCallbacks {
         bt_bonded = auth_cmpl.success;
         btFormatAddr(auth_cmpl.bd_addr, bt_peer_addr, sizeof(bt_peer_addr));
         if (auth_cmpl.success) {
-            Serial.printf("BT: paired with %s\n", bt_peer_addr);
+            SERIAL_LOGF("BT: paired with %s\n", bt_peer_addr);
         } else {
-            Serial.printf("BT: pair failed reason=0x%02X\n", auth_cmpl.fail_reason);
+            SERIAL_LOGF("BT: pair failed reason=0x%02X\n", auth_cmpl.fail_reason);
         }
         render_requested = true;
         term_render_requested = true;
     }
 
     bool onConfirmPIN(uint32_t pin) override {
-        Serial.printf("BT: confirm pin %06u\n", (unsigned)pin);
+        SERIAL_LOGF("BT: confirm pin %06u\n", (unsigned)pin);
         return true;
     }
 };
@@ -188,7 +188,7 @@ static void btStartAdvertising() {
     bt_adv_started_at = millis();
     bt_state = BT_STATE_ADVERTISING;
     btSetStatusValue("advertising");
-    Serial.println("BT: advertising");
+    SERIAL_LOGLN("BT: advertising");
 }
 
 void btInit() {
@@ -215,7 +215,7 @@ void btInit() {
     bt_server = BLEDevice::createServer();
     if (!bt_server) {
         bt_state = BT_STATE_ERROR;
-        Serial.println("BT: createServer failed");
+        SERIAL_LOGLN("BT: createServer failed");
         return;
     }
     bt_server->setCallbacks(&bt_server_callbacks);
@@ -223,14 +223,14 @@ void btInit() {
     bt_service = bt_server->createService(BT_SERVICE_UUID);
     if (!bt_service) {
         bt_state = BT_STATE_ERROR;
-        Serial.println("BT: createService failed");
+        SERIAL_LOGLN("BT: createService failed");
         return;
     }
 
     bt_status_char = bt_service->createCharacteristic(BT_STATUS_CHAR_UUID, BLECharacteristic::PROPERTY_READ);
     if (!bt_status_char) {
         bt_state = BT_STATE_ERROR;
-        Serial.println("BT: createCharacteristic failed");
+        SERIAL_LOGLN("BT: createCharacteristic failed");
         return;
     }
     bt_status_char->setAccessPermissions(btReadPerm());
@@ -250,7 +250,7 @@ void btInit() {
     bt_peer_addr[0] = '\0';
 
     btStartAdvertising();
-    Serial.printf("BT: bare mode ready name=%s%s\n",
+    SERIAL_LOGF("BT: bare mode ready name=%s%s\n",
                   config_bt_name,
                   btPasskeyConfigured() ? " (secure pin)" : "");
 }
@@ -275,7 +275,7 @@ bool btSetEnabled(bool enabled) {
         bt_peer_addr[0] = '\0';
         render_requested = true;
         term_render_requested = true;
-        Serial.println("BT: disabled");
+        SERIAL_LOGLN("BT: disabled");
         return false;
     }
 
@@ -306,7 +306,7 @@ void btPoll() {
             btSetStatusValue("idle");
             render_requested = true;
             term_render_requested = true;
-            Serial.println("BT: advertising timeout -> idle");
+            SERIAL_LOGLN("BT: advertising timeout -> idle");
         }
     }
 }
