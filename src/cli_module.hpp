@@ -22,6 +22,8 @@ static constexpr size_t TRANSFER_CHUNK_SIZE = 256;
 static constexpr size_t TRANSFER_LINE_MAX = 192;
 static constexpr uint32_t TRANSFER_TASK_STACK = 8192;
 static constexpr uint32_t TRANSFER_SSH_WAIT_MS = 45000;
+static constexpr const char* DOWNLOAD_MANIFEST_PATH = "/.tdeck_download_manifest.tmp";
+static constexpr const char* DOWNLOAD_MANIFEST_NAME = ".tdeck_download_manifest.tmp";
 static constexpr size_t SHORTCUT_PATH_MAX = 96;
 static constexpr size_t SHORTCUT_NAME_MAX = 64;
 static constexpr int SHORTCUT_MAX_STEPS = 24;
@@ -243,6 +245,30 @@ bool ensureSshForTransfer(const char* action_label) {
     return true;
 }
 
+void pauseSshReceiveTaskForExec(bool* out_paused) {
+    if (!out_paused) return;
+    if (ssh_recv_task_handle) {
+        vTaskDelete(ssh_recv_task_handle);
+        ssh_recv_task_handle = NULL;
+        *out_paused = true;
+    }
+}
+
+void resumeSshReceiveTaskForExec(bool was_paused) {
+    if (!was_paused) return;
+    if (!ssh_recv_task_handle && ssh_connected && ssh_chan) {
+        xTaskCreatePinnedToCore(
+            sshReceiveTask,
+            "ssh_recv",
+            16384,
+            NULL,
+            1,
+            &ssh_recv_task_handle,
+            0
+        );
+    }
+}
+
 bool uploadStreamFile(ssh_channel channel, const char* file_name) {
     if (!isSafeTransferName(file_name)) return false;
 
@@ -291,6 +317,127 @@ bool uploadStreamFile(ssh_channel channel, const char* file_name) {
 
     const char nl = '\n';
     return sshWriteAll(channel, (const uint8_t*)&nl, 1);
+}
+
+void trimLineEnd(char* s) {
+    if (!s) return;
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == '\r' || s[n - 1] == '\n')) {
+        s[n - 1] = '\0';
+        n--;
+    }
+}
+
+bool resetDownloadManifest() {
+    sdAcquire();
+    SD.remove(DOWNLOAD_MANIFEST_PATH);
+    File f = SD.open(DOWNLOAD_MANIFEST_PATH, FILE_WRITE);
+    bool ok = (bool)f;
+    if (f) f.close();
+    sdRelease();
+    return ok;
+}
+
+bool appendDownloadManifestName(const char* file_name) {
+    if (!file_name || !isSafeTransferName(file_name)) return false;
+    sdAcquire();
+    File f = SD.open(DOWNLOAD_MANIFEST_PATH, FILE_APPEND);
+    if (!f) {
+        sdRelease();
+        return false;
+    }
+    size_t expected = strlen(file_name);
+    size_t written = f.write((const uint8_t*)file_name, expected);
+    bool ok = (written == expected) && f.print('\n') == 1;
+    f.close();
+    sdRelease();
+    return ok;
+}
+
+bool manifestContainsName(File& manifest, const char* target) {
+    if (!manifest || !target || target[0] == '\0') return false;
+    if (!manifest.seek(0)) return false;
+
+    char line[72];
+    while (manifest.available()) {
+        int n = manifest.readBytesUntil('\n', line, sizeof(line) - 1);
+        line[n] = '\0';
+        trimLineEnd(line);
+
+        if (n == (int)sizeof(line) - 1) {
+            int peeked = manifest.peek();
+            if (peeked >= 0 && peeked != '\n' && peeked != '\r') {
+                while (manifest.available()) {
+                    int ch = manifest.read();
+                    if (ch == '\n') break;
+                }
+            }
+        }
+
+        if (strcmp(line, target) == 0) return true;
+    }
+    return false;
+}
+
+int pruneLocalFilesAgainstManifest() {
+    sdAcquire();
+    File manifest = SD.open(DOWNLOAD_MANIFEST_PATH, FILE_READ);
+    if (!manifest) {
+        sdRelease();
+        return -1;
+    }
+
+    File dir = SD.open("/");
+    if (!dir || !dir.isDirectory()) {
+        if (dir) dir.close();
+        manifest.close();
+        sdRelease();
+        return -1;
+    }
+
+    int removed = 0;
+    File entry = dir.openNextFile();
+    while (entry) {
+        const char* full_name = entry.name();
+        bool is_dir = entry.isDirectory();
+        const char* slash = full_name ? strrchr(full_name, '/') : NULL;
+        const char* name = slash ? slash + 1 : (full_name ? full_name : "");
+
+        char local_name[64];
+        strncpy(local_name, name, sizeof(local_name) - 1);
+        local_name[sizeof(local_name) - 1] = '\0';
+        entry.close();
+
+        bool keep = is_dir ||
+                    local_name[0] == '\0' ||
+                    strcmp(local_name, DOWNLOAD_MANIFEST_NAME) == 0 ||
+                    !isSafeTransferName(local_name);
+        if (!keep) {
+            if (!manifestContainsName(manifest, local_name)) {
+                String path = "/" + String(local_name);
+                if (!SD.remove(path.c_str())) {
+                    dir.close();
+                    manifest.close();
+                    sdRelease();
+                    return -1;
+                }
+                removed++;
+            }
+        }
+
+        entry = dir.openNextFile();
+    }
+
+    dir.close();
+    manifest.close();
+    sdRelease();
+    return removed;
+}
+
+void cleanupDownloadManifest() {
+    sdAcquire();
+    SD.remove(DOWNLOAD_MANIFEST_PATH);
+    sdRelease();
 }
 
 bool parseDownloadHeader(const char* line, size_t* out_size, char* out_name, size_t out_name_len) {
@@ -350,6 +497,9 @@ static const char* REMOTE_UPLOAD_STREAM_CMD =
     "set -eu; "
     "dest=\"$HOME/tdeck\"; "
     "mkdir -p \"$dest\"; "
+    "manifest=\"$dest/.tdeck_upload_manifest.$$\"; "
+    ": > \"$manifest\"; "
+    "trap \"rm -f \\\"$manifest\\\"\" EXIT; "
     "while IFS= read -r header; do "
     "  [ \"$header\" = \"DONE\" ] && break; "
     "  case \"$header\" in FILE\\ *) ;; *) exit 31;; esac; "
@@ -358,10 +508,18 @@ static const char* REMOTE_UPLOAD_STREAM_CMD =
     "  name=${meta#* }; "
     "  case \"$len\" in \"\"|*[!0-9]*) exit 32;; esac; "
     "  case \"$name\" in \"\"|*/*) exit 33;; esac; "
+    "  printf \"%s\\n\" \"$name\" >> \"$manifest\" || exit 37; "
     "  tmp=\"$dest/.${name}.tmp.$$\"; "
     "  dd bs=1 count=\"$len\" of=\"$tmp\" 2>/dev/null || exit 34; "
     "  IFS= read -r _sep || exit 35; "
     "  mv \"$tmp\" \"$dest/$name\" || exit 36; "
+    "done; "
+    "for f in \"$dest\"/.* \"$dest\"/*; do "
+    "  [ -f \"$f\" ] || continue; "
+    "  base=${f##*/}; "
+    "  case \"$base\" in .|..) continue;; esac; "
+    "  [ \"$f\" = \"$manifest\" ] && continue; "
+    "  grep -Fxq \"$base\" \"$manifest\" || rm -f \"$f\" || exit 38; "
     "done; "
     "printf \"OK\\n\""
     "'";
@@ -396,6 +554,8 @@ void uploadTask(void* param) {
         vTaskDelete(NULL);
         return;
     }
+    bool paused_recv = false;
+    pauseSshReceiveTaskForExec(&paused_recv);
 
     // List flat files at root
     int n = listDirectory("/");
@@ -410,21 +570,25 @@ void uploadTask(void* param) {
     cmdSetResult("Uploading %d files...", upload_total_count);
     render_requested = true;
 
-    if (upload_total_count == 0) {
-        cmdSetResult("No valid files to upload");
-        render_requested = true;
-        upload_running = false;
-        vTaskDelete(NULL);
-        return;
-    }
-
     ssh_channel channel = NULL;
     if (!sshOpenExecChannel(REMOTE_UPLOAD_STREAM_CMD, &channel)) {
-        cmdSetResult("Upload start failed: %s", ssh_get_error(ssh_sess));
-        render_requested = true;
-        upload_running = false;
-        vTaskDelete(NULL);
-        return;
+        // Recover from stale/broken SSH sessions.
+        sshDisconnect();
+        if (!ensureSshForTransfer("Upload retry")) {
+            resumeSshReceiveTaskForExec(paused_recv);
+            upload_running = false;
+            vTaskDelete(NULL);
+            return;
+        }
+        pauseSshReceiveTaskForExec(&paused_recv);
+        if (!sshOpenExecChannel(REMOTE_UPLOAD_STREAM_CMD, &channel)) {
+            cmdSetResult("Upload start failed: %s", ssh_get_error(ssh_sess));
+            render_requested = true;
+            resumeSshReceiveTaskForExec(paused_recv);
+            upload_running = false;
+            vTaskDelete(NULL);
+            return;
+        }
     }
 
     bool stream_ok = true;
@@ -455,6 +619,7 @@ void uploadTask(void* param) {
         cmdSetResult("Upload failed (%d/%d)", upload_done_count, upload_total_count);
     }
     render_requested = true;
+    resumeSshReceiveTaskForExec(paused_recv);
     upload_running = false;
     vTaskDelete(NULL);
 }
@@ -473,14 +638,37 @@ void downloadTask(void* param) {
         vTaskDelete(NULL);
         return;
     }
-
-    ssh_channel channel = NULL;
-    if (!sshOpenExecChannel(REMOTE_DOWNLOAD_STREAM_CMD, &channel)) {
-        cmdSetResult("Download start failed: %s", ssh_get_error(ssh_sess));
+    if (!resetDownloadManifest()) {
+        cmdSetResult("Download prep failed");
         render_requested = true;
         download_running = false;
         vTaskDelete(NULL);
         return;
+    }
+    bool paused_recv = false;
+    pauseSshReceiveTaskForExec(&paused_recv);
+
+    ssh_channel channel = NULL;
+    if (!sshOpenExecChannel(REMOTE_DOWNLOAD_STREAM_CMD, &channel)) {
+        // Recover from stale/broken SSH sessions.
+        sshDisconnect();
+        if (!ensureSshForTransfer("Download retry")) {
+            cleanupDownloadManifest();
+            resumeSshReceiveTaskForExec(paused_recv);
+            download_running = false;
+            vTaskDelete(NULL);
+            return;
+        }
+        pauseSshReceiveTaskForExec(&paused_recv);
+        if (!sshOpenExecChannel(REMOTE_DOWNLOAD_STREAM_CMD, &channel)) {
+            cmdSetResult("Download start failed: %s", ssh_get_error(ssh_sess));
+            render_requested = true;
+            cleanupDownloadManifest();
+            resumeSshReceiveTaskForExec(paused_recv);
+            download_running = false;
+            vTaskDelete(NULL);
+            return;
+        }
     }
 
     cmdSetResult("Downloading...");
@@ -510,6 +698,10 @@ void downloadTask(void* param) {
         uint32_t fsz = file_size > UINT32_MAX ? UINT32_MAX : (uint32_t)file_size;
         download_bytes_total = satAddU32(download_bytes_total, fsz);
         if (downloadStreamFile(channel, file_name, file_size)) {
+            if (!appendDownloadManifestName(file_name)) {
+                stream_ok = false;
+                break;
+            }
             download_done_count++;
             render_requested = true;
         } else {
@@ -519,12 +711,21 @@ void downloadTask(void* param) {
 
     int exit_status = sshCloseExecChannel(channel);
 
+    bool pruned_ok = false;
+    int pruned_count = 0;
     if (stream_ok && saw_done && exit_status == 0) {
-        cmdSetResult("Download done: %d files", download_done_count);
+        pruned_count = pruneLocalFilesAgainstManifest();
+        pruned_ok = (pruned_count >= 0);
+    }
+    cleanupDownloadManifest();
+
+    if (stream_ok && saw_done && exit_status == 0 && pruned_ok) {
+        cmdSetResult("Download done: %d files (%d removed)", download_done_count, pruned_count);
     } else {
         cmdSetResult("Download failed (%d/%d)", download_done_count, download_total_count);
     }
     render_requested = true;
+    resumeSshReceiveTaskForExec(paused_recv);
     download_running = false;
     vTaskDelete(NULL);
 }

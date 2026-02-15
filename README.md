@@ -5,7 +5,7 @@ Firmware for the LilyGo T-Deck Pro: e-ink notepad, SSH terminal, SD-card file wo
 ## Overview
 - Default mode is a keyboard-driven notepad rendered on the e-ink panel.
 - `ssh` switches to terminal mode (WiFi first, then VPN fallback when configured).
-- Files live on SD root and can be edited/saved on-device or transferred with SCP (`upload` / `download`).
+- Files live on SD root and can be edited/saved on-device or transferred with SCP mirror sync (`upload` / `download`).
 - Bluetooth mode is a BLE peripheral service (not a HID keyboard), so phones keep their on-screen keyboard.
 
 ## Quickstart
@@ -132,8 +132,8 @@ Touch arrows in command mode browse command history. In file-picker mode: Up/Dow
 | `w` / `save [file]` | Save notepad to current file (or provided filename) |
 | `daily` | Open today’s file as `YYYY-MM-DD.md` (local timezone) |
 | `r` / `rm <file>` | Delete a file |
-| `u` / `upload` | SCP all SD files to `~/tdeck` on SSH host |
-| `d` / `download` | SCP `~/tdeck` files to SD card |
+| `u` / `upload` | Mirror SD root to `~/tdeck` on SSH host (overwrite + delete extras on host) |
+| `d` / `download` | Mirror `~/tdeck` to SD root (overwrite + delete extras on SD) |
 | `p` / `paste` | Paste notepad to SSH |
 | `ssh` | Switch to terminal mode and connect if needed |
 | `np` | Return to notepad mode |
