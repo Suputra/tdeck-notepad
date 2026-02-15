@@ -176,7 +176,6 @@ Touch **Up/Down arrows** in command mode to browse previous/next commands.
 | `bt` | Toggle Bluetooth on/off |
 | `gnss` | Toggle GNSS on/off |
 | `gs` | Scan GNSS details (non-blocking: fix/sats/time/lat/lon/alt/hdop/speed/course) |
-| `gnssraw` | Show latest raw RMC/GGA lines |
 | `s` / `status` | Show WiFi/SSH/VPN/battery status (GNSS on/off only) |
 | `h` / `help` | Show help |
 | `<name>` or `<name>.x` | Run shortcut script from `/<name>.x` |

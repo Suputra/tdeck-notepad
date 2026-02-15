@@ -1448,27 +1448,6 @@ void btScanCommand() {
     cmdSetResult("Scanning BT...");
 }
 
-void gnssRawCommand() {
-    GnssSnapshot snap;
-    gnssGetSnapshot(&snap);
-
-    cmdClearResult();
-    cmdAddLine("GNSS:%s raw baud:%d", snap.power_on ? "on" : "off", snap.uart_baud);
-    cmdAddLine("bytes:%u sents:%u csum:%u parse:%u bsw:%u",
-               snap.total_bytes,
-               snap.total_sentences,
-               snap.checksum_failures,
-               snap.parse_failures,
-               snap.baud_switches);
-    if (snap.last_rmc[0] != '\0') cmdAddLine("RMC:%s", snap.last_rmc);
-    if (snap.last_gga[0] != '\0') cmdAddLine("GGA:%s", snap.last_gga);
-    if (snap.last_rmc[0] == '\0' && snap.last_gga[0] == '\0') cmdAddLine("No NMEA yet");
-    cmdAddLine("USB serial has full lines");
-
-    if (snap.last_rmc[0] != '\0') SERIAL_LOGF("GNSS RMC %s\n", snap.last_rmc);
-    if (snap.last_gga[0] != '\0') SERIAL_LOGF("GNSS GGA %s\n", snap.last_gga);
-}
-
 void dailyOpenCommand() {
     char name[20];
     if (!timeSyncClockLooksValid()) {
@@ -1656,8 +1635,6 @@ bool executeCommand(const char* cmd) {
             else snprintf(sats, sizeof(sats), "-");
             cmdSetResult("GNSS %s fix:%s sats:%s", next ? "on" : "off", snap.has_fix ? "yes" : "no", sats);
         }
-    } else if (strcmp(word, "gnssraw") == 0) {
-        gnssRawCommand();
     } else if (strcmp(word, "date") == 0) {
         clockDateCommand();
     } else if (strcmp(word, "s") == 0 || strcmp(word, "status") == 0) {
@@ -1690,7 +1667,7 @@ bool executeCommand(const char* cmd) {
         cmdClearResult();
         cmdAddLine("l/ls e/edit w/save daily r/rm");
         cmdAddLine("u/upload d/download p/paste ssh np dc");
-        cmdAddLine("ws wfi bs bt gnss gs gnssraw");
+        cmdAddLine("ws wfi bs bt gnss gs");
         cmdAddLine("date s/status h/help");
         cmdAddLine("<name> runs /name.x shortcut");
     } else {
