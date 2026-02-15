@@ -1861,6 +1861,7 @@ void setup() {
 void loop() {
     agentPollSerial();
     perfLoopTick();
+    wifiScanPoll();
     gnssPoll();
 
     // Press BOOT to request power-off (same behavior as the "off" command).

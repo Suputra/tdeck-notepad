@@ -31,6 +31,55 @@ static constexpr uint32_t SHORTCUT_WAIT_TIMEOUT_MS = 300000;
 
 static char shortcut_pending_path[SHORTCUT_PATH_MAX] = "";
 static char shortcut_pending_name[SHORTCUT_NAME_MAX] = "";
+static bool wifi_scan_pending = false;
+
+void finishWifiScanCommand() {
+    int n = WiFi.scanComplete();
+    wifi_scan_pending = false;
+
+    if (n == WIFI_SCAN_FAILED) {
+        cmdSetResult("Scan failed");
+        WiFi.scanDelete();
+        render_requested = true;
+        return;
+    }
+
+    if (n <= 0) {
+        cmdSetResult("No WiFi networks found");
+        WiFi.scanDelete();
+        render_requested = true;
+        return;
+    }
+
+    cmdClearResult();
+    cmdAddLine("Scan: %d network(s)", n);
+    for (int i = 0; i < n && i < 8; i++) {
+        int cfg_idx = wifiConfigIndexForSSID(WiFi.SSID(i));
+        cmdAddLine("%c %s %ddBm",
+                   cfg_idx >= 0 ? '*' : ' ',
+                   WiFi.SSID(i).c_str(),
+                   WiFi.RSSI(i));
+    }
+
+    bool has_known = false;
+    for (int i = 0; i < n; i++) {
+        if (wifiConfigIndexForSSID(WiFi.SSID(i)) >= 0) {
+            has_known = true;
+            break;
+        }
+    }
+    cmdAddLine(has_known ? "Use cmd: wifi" : "No known SSIDs in scan");
+
+    WiFi.scanDelete();
+    render_requested = true;
+}
+
+void wifiScanPoll() {
+    if (!wifi_scan_pending) return;
+    int scan_state = WiFi.scanComplete();
+    if (scan_state == WIFI_SCAN_RUNNING) return;
+    finishWifiScanCommand();
+}
 
 uint32_t satAddU32(uint32_t a, uint32_t b) {
     if (UINT32_MAX - a < b) return UINT32_MAX;
@@ -1265,86 +1314,20 @@ void wifiToggleCommand() {
 }
 
 void wifiScanCommand() {
+    if (wifi_scan_pending) {
+        cmdSetResult("Scan already running");
+        return;
+    }
+
     WiFi.mode(WIFI_STA);
-    int n = WiFi.scanNetworks();
-    if (n < 0) {
+    WiFi.scanDelete();
+    int scan_start = WiFi.scanNetworks(true /* async */);
+    if (scan_start == WIFI_SCAN_FAILED) {
         cmdSetResult("Scan failed");
         return;
     }
-    if (n == 0) {
-        cmdSetResult("No WiFi networks found");
-        return;
-    }
-
-    cmdClearResult();
-    cmdAddLine("Scan: %d network(s)", n);
-    for (int i = 0; i < n && i < 6; i++) {
-        int cfg_idx = wifiConfigIndexForSSID(WiFi.SSID(i));
-        cmdAddLine("%c %s %ddBm",
-                   cfg_idx >= 0 ? '*' : ' ',
-                   WiFi.SSID(i).c_str(),
-                   WiFi.RSSI(i));
-    }
-
-    bool connected = false;
-    bool tried_known = false;
-    bool tried_cfg[MAX_WIFI_APS] = { false };
-    for (;;) {
-        int best_cfg = -1;
-        int best_rssi = -1000;
-        for (int i = 0; i < n; i++) {
-            int cfg_idx = wifiConfigIndexForSSID(WiFi.SSID(i));
-            if (cfg_idx < 0 || tried_cfg[cfg_idx]) continue;
-            if (WiFi.RSSI(i) > best_rssi) {
-                best_rssi = WiFi.RSSI(i);
-                best_cfg = cfg_idx;
-            }
-        }
-        if (best_cfg < 0) break;
-
-        tried_known = true;
-        tried_cfg[best_cfg] = true;
-        cmdAddLine("Try: %s", config_wifi[best_cfg].ssid);
-        WiFiAttemptResult attempt = wifiTryAP(config_wifi[best_cfg].ssid, config_wifi[best_cfg].pass, WIFI_CONNECT_TIMEOUT_MS);
-        if (attempt.connected) {
-            connected = true;
-            wifi_state = WIFI_CONNECTED;
-            wifiClearLastFailure();
-            cmdAddLine("WiFi: %s", WiFi.localIP().toString().c_str());
-            cmdAddLine("Clock: NTP sync...");
-            if (wifiSyncClockNtp()) cmdAddLine("Clock: NTP synced");
-            else cmdAddLine("Clock: NTP failed");
-            break;
-        } else {
-            char reason[48];
-            wifiFormatFailureReason(attempt, reason, sizeof(reason));
-            wifi_state = WIFI_FAILED;
-            wifiSetLastFailure(config_wifi[best_cfg].ssid, reason);
-            cmdAddLine("  fail: %s", reason);
-        }
-    }
-
-    if (!connected) {
-        if (WiFi.status() == WL_CONNECTED) {
-            wifi_state = WIFI_CONNECTED;
-            cmdAddLine("WiFi: %s", WiFi.SSID().c_str());
-            cmdAddLine("Clock: NTP sync...");
-            if (wifiSyncClockNtp()) cmdAddLine("Clock: NTP synced");
-            else cmdAddLine("Clock: NTP failed");
-        } else {
-            wifi_state = WIFI_FAILED;
-            if (!tried_known) {
-                cmdAddLine("No known SSIDs in scan");
-            } else {
-                cmdAddLine("Known APs failed");
-                if (wifi_last_fail_ssid[0] != '\0') {
-                    cmdAddLine("%s: %s", wifi_last_fail_ssid, wifi_last_fail_reason);
-                }
-            }
-        }
-    }
-
-    WiFi.scanDelete();
+    wifi_scan_pending = true;
+    cmdSetResult("Scanning WiFi...");
 }
 
 void gnssRawCommand() {
