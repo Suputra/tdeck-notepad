@@ -1,4 +1,4 @@
-# T-Deck Pro Notepad
+# s-term
 
 Firmware for the LilyGo T-Deck Pro: e-ink notepad, SSH terminal, SD-card file workflow, optional WireGuard fallback, and optional BLE/GPS/4G/Meshtastic-radio features.
 
