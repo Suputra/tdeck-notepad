@@ -238,7 +238,7 @@ static void agentRunCommand(char* line) {
         return;
     }
     if (strcasecmp(p, "HELP") == 0) {
-        agentReplyOk("commands=PING HELP STATE GPS RESULT TRACE TERMDBG TERMSNAP TERMHEX TERMRANGE KEY PRESS TEXT CMD WAIT RENDER BOOTOFF");
+        agentReplyOk("commands=PING HELP STATE GPS WIFI RESULT RESULTALL TRACE TERMDBG TERMSNAP TERMHEX TERMRANGE KEY PRESS TEXT CMD WAIT RENDER BOOTOFF");
         return;
     }
 
@@ -350,6 +350,47 @@ static void agentRunCommand(char* line) {
 
     if (!agentTakeStateLock()) {
         agentReplyErr("busy: state lock timeout");
+        return;
+    }
+
+    if (strcasecmp(p, "WIFI") == 0) {
+        wifi_mode_t mode = WiFi.getMode();
+        wl_status_t status = WiFi.status();
+        String ssid = WiFi.SSID();
+        String ip = WiFi.localIP().toString();
+        int rssi = WiFi.RSSI();
+
+        if (arg && strcasecmp(arg, "SCAN") == 0) {
+            // Synchronous blocking scan for diagnostics
+            WiFi.mode(WIFI_STA);
+            delay(200);  // let radio settle after mode change
+            wifi_mode_t mode_after = WiFi.getMode();
+            wl_status_t status_after = WiFi.status();
+            WiFi.scanDelete();
+            int n = WiFi.scanNetworks(false /* blocking */, true /* show_hidden */, false, 5000);
+            if (n == WIFI_SCAN_FAILED) {
+                agentReplyOk("WIFI SCAN failed pre_mode=%d pre_status=%d post_mode=%d post_status=%d state=%d",
+                    (int)mode, (int)status, (int)mode_after, (int)status_after, (int)wifi_state);
+            } else if (n <= 0) {
+                agentReplyOk("WIFI SCAN 0 networks pre_mode=%d pre_status=%d post_mode=%d post_status=%d state=%d",
+                    (int)mode, (int)status, (int)mode_after, (int)status_after, (int)wifi_state);
+            } else {
+                agentReplyOk("WIFI SCAN %d networks pre_mode=%d pre_status=%d post_mode=%d post_status=%d state=%d",
+                    n, (int)mode, (int)status, (int)mode_after, (int)status_after, (int)wifi_state);
+                for (int i = 0; i < n && i < 16; i++) {
+                    Serial.printf("AGENT WIFI_AP %d ssid=%s rssi=%d ch=%d enc=%d\n",
+                        i, WiFi.SSID(i).c_str(), WiFi.RSSI(i),
+                        WiFi.channel(i), (int)WiFi.encryptionType(i));
+                }
+            }
+            WiFi.scanDelete();
+        } else {
+            agentReplyOk("WIFI mode=%d status=%d state=%d ssid=%s ip=%s rssi=%d",
+                (int)mode, (int)status, (int)wifi_state,
+                ssid.length() > 0 ? ssid.c_str() : "(none)",
+                ip.c_str(), rssi);
+        }
+        xSemaphoreGive(state_mutex);
         return;
     }
 
@@ -487,6 +528,20 @@ static void agentRunCommand(char* line) {
         } else {
             agentReplyOk("RESULT %s", cmd_result[0]);
         }
+        xSemaphoreGive(state_mutex);
+        return;
+    }
+
+    if (strcasecmp(p, "RESULTALL") == 0) {
+        if (!cmd_result_valid || cmd_result_count <= 0) {
+            agentReplyOk("RESULTALL 0 lines");
+        } else {
+            agentReplyOk("RESULTALL %d lines", cmd_result_count);
+            for (int i = 0; i < cmd_result_count; i++) {
+                Serial.printf("RESULT %d %s\n", i, cmd_result[i]);
+            }
+        }
+        Serial.println("RESULTALL END");
         xSemaphoreGive(state_mutex);
         return;
     }

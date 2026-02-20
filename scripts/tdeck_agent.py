@@ -58,15 +58,29 @@ def send_and_wait(ser: serial.Serial, command: str, timeout_s: float, echo_all: 
     print(f">> {wire}")
 
     deadline = time.monotonic() + timeout_s
+    first_response = None
     while True:
         line = read_line(ser, deadline)
         if line is None:
+            if first_response is not None:
+                return first_response
             raise TimeoutError(f"timed out waiting for AGENT response to: {wire}")
         if line.startswith("AGENT "):
             print(f"<< {line}")
-            return line
+            if first_response is None and (line.startswith("AGENT OK ") or line.startswith("AGENT ERR ")):
+                first_response = line
+                # Continue reading trailing AGENT lines for a short window
+                deadline = min(deadline, time.monotonic() + 1.0)
+                continue
+            # Additional AGENT lines (e.g. AGENT WIFI_AP, AGENT RESULT)
+            continue
         if echo_all and line:
             print(f".. {line}")
+        if first_response is not None:
+            # Non-AGENT line after response means we're done
+            if line:
+                print(f".. {line}") if echo_all else None
+            return first_response
 
 
 def main() -> int:
