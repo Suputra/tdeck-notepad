@@ -1,5 +1,180 @@
 // --- Command Processor ---
 
+// --- HTTP Client for Files Service ---
+#include <HTTPClient.h>
+
+// URL builders for files service
+static void mountsUrl(char* out, size_t len) {
+    snprintf(out, len, "%s/mounts", config_files_url);
+}
+static void mountFilesUrl(char* out, size_t len) {
+    snprintf(out, len, "%s/m/%s/files", config_files_url, active_mount.c_str());
+}
+static void mountFileUrl(char* out, size_t len, const char* name) {
+    snprintf(out, len, "%s/m/%s/files/%s", config_files_url, active_mount.c_str(), name);
+}
+static void mountPushUrl(char* out, size_t len) {
+    snprintf(out, len, "%s/m/%s/push", config_files_url, active_mount.c_str());
+}
+
+// HTTP GET — returns HTTP status code, writes body into out
+static int httpGet(const char* url, String* out) {
+    if (wifi_state != WIFI_CONNECTED) return -1;
+    HTTPClient http;
+    http.begin(url);
+    http.setTimeout(10000);
+    int code = http.GET();
+    if (code > 0 && out) *out = http.getString();
+    http.end();
+    return code;
+}
+
+// HTTP PUT — returns HTTP status code
+static int httpPut(const char* url, const char* body, int bodyLen, String* out) {
+    if (wifi_state != WIFI_CONNECTED) return -1;
+    HTTPClient http;
+    http.begin(url);
+    http.setTimeout(10000);
+    http.addHeader("Content-Type", "text/plain");
+    int code = http.PUT((uint8_t*)body, bodyLen);
+    if (code > 0 && out) *out = http.getString();
+    http.end();
+    return code;
+}
+
+// HTTP POST — returns HTTP status code
+static int httpPost(const char* url, String* out) {
+    if (wifi_state != WIFI_CONNECTED) return -1;
+    HTTPClient http;
+    http.begin(url);
+    http.setTimeout(30000);
+    http.addHeader("Content-Type", "application/json");
+    int code = http.POST("");
+    if (code > 0 && out) *out = http.getString();
+    http.end();
+    return code;
+}
+
+// Fetch mount list from service, populate mount_list[]
+static bool fetchMountList() {
+    char url[192];
+    mountsUrl(url, sizeof(url));
+    String body;
+    int code = httpGet(url, &body);
+    if (code != 200) return false;
+
+    // Parse simple JSON array: ["daily","notes"]
+    mount_list_count = 0;
+    int pos = 0;
+    int len = body.length();
+    while (pos < len && mount_list_count < MAX_MOUNT_LIST) {
+        int q1 = body.indexOf('"', pos);
+        if (q1 < 0) break;
+        int q2 = body.indexOf('"', q1 + 1);
+        if (q2 < 0) break;
+        int slen = q2 - q1 - 1;
+        if (slen > 0 && slen < 31) {
+            body.substring(q1 + 1, q2).toCharArray(mount_list[mount_list_count], 32);
+            mount_list_count++;
+        }
+        pos = q2 + 1;
+    }
+    return mount_list_count > 0;
+}
+
+// List remote files into file_list[], returns count or -1
+static int listRemoteFiles() {
+    char url[256];
+    mountFilesUrl(url, sizeof(url));
+    String body;
+    int code = httpGet(url, &body);
+    if (code != 200) return -1;
+
+    // Parse JSON array of {"name":"...","size":N}
+    file_list_count = 0;
+    int pos = 0;
+    int len = body.length();
+    while (pos < len && file_list_count < MAX_FILE_LIST) {
+        int nameKey = body.indexOf("\"name\"", pos);
+        if (nameKey < 0) break;
+        int q1 = body.indexOf('"', nameKey + 6);
+        if (q1 < 0) break;
+        int q2 = body.indexOf('"', q1 + 1);
+        if (q2 < 0) break;
+        String fname = body.substring(q1 + 1, q2);
+
+        int sizeKey = body.indexOf("\"size\"", q2);
+        size_t fsize = 0;
+        if (sizeKey >= 0) {
+            int numStart = sizeKey + 6;
+            while (numStart < len && (body[numStart] == ':' || body[numStart] == ' ')) numStart++;
+            fsize = 0;
+            while (numStart < len && body[numStart] >= '0' && body[numStart] <= '9') {
+                fsize = fsize * 10 + (body[numStart] - '0');
+                numStart++;
+            }
+            pos = numStart;
+        } else {
+            pos = q2 + 1;
+        }
+
+        strncpy(file_list[file_list_count].name, fname.c_str(), sizeof(file_list[0].name) - 1);
+        file_list[file_list_count].name[sizeof(file_list[0].name) - 1] = '\0';
+        file_list[file_list_count].is_dir = false;
+        file_list[file_list_count].size = fsize;
+        file_list_count++;
+    }
+    return file_list_count;
+}
+
+// Load a remote file into text_buf
+static bool loadRemoteFile(const char* name) {
+    char url[256];
+    mountFileUrl(url, sizeof(url), name);
+    String body;
+    int code = httpGet(url, &body);
+    if (code != 200) return false;
+
+    int sz = body.length();
+    if (sz > MAX_TEXT_LEN) sz = MAX_TEXT_LEN;
+    memcpy(text_buf, body.c_str(), sz);
+    text_buf[sz] = '\0';
+    text_len = sz;
+    cursor_pos = text_len;
+    scroll_line = 0;
+    file_modified = false;
+    file_is_remote = true;
+    return true;
+}
+
+// Save text_buf to remote file
+static bool saveRemoteFile(const char* name) {
+    char url[256];
+    mountFileUrl(url, sizeof(url), name);
+    String resp;
+    int code = httpPut(url, text_buf, text_len, &resp);
+    if (code == 200) {
+        file_modified = false;
+        return true;
+    }
+    return false;
+}
+
+// Mount picker: select from fetched mount list
+bool cmdMountPickerOpenSelectedInternal() {
+    if (cmd_picker_mode != CMD_PICKER_MOUNT || !cmdPickerIsActive()) return false;
+    int list_idx = cmd_picker_selected;
+    if (list_idx < 0 || list_idx >= cmd_picker_count) return false;
+    int ref_idx = cmd_picker_indices[list_idx];
+    if (ref_idx < 0 || ref_idx >= mount_list_count) return false;
+
+    active_mount = mount_list[ref_idx];
+    file_is_remote = false;
+    cmdPickerStop();
+    cmdSetResult("Mount: %s", active_mount.c_str());
+    return true;
+}
+
 // --- Streaming Upload/Download ---
 
 static volatile bool upload_running = false;
@@ -1999,18 +2174,35 @@ void dailyOpenCommand() {
     }
 
     autoSaveDirty();
-    String path = "/" + String(name);
-    if (loadFromFile(path.c_str())) {
-        current_file = path;
-        cmdSetResult("Daily %s (%d B)", name, text_len);
+
+    if (mountActive()) {
+        if (loadRemoteFile(name)) {
+            current_file = String("/") + String(name);
+            cmdSetResult("Daily %s (%d B)", name, text_len);
+        } else {
+            text_len = 0;
+            cursor_pos = 0;
+            scroll_line = 0;
+            text_buf[0] = '\0';
+            current_file = String("/") + String(name);
+            file_is_remote = true;
+            file_modified = false;
+            cmdSetResult("Daily new %s", name);
+        }
     } else {
-        text_len = 0;
-        cursor_pos = 0;
-        scroll_line = 0;
-        text_buf[0] = '\0';
-        current_file = path;
-        file_modified = false;
-        cmdSetResult("Daily new %s", name);
+        String path = "/" + String(name);
+        if (loadFromFile(path.c_str())) {
+            current_file = path;
+            cmdSetResult("Daily %s (%d B)", name, text_len);
+        } else {
+            text_len = 0;
+            cursor_pos = 0;
+            scroll_line = 0;
+            text_buf[0] = '\0';
+            current_file = path;
+            file_modified = false;
+            cmdSetResult("Daily new %s", name);
+        }
     }
     app_mode = MODE_NOTEPAD;
 }
@@ -2047,9 +2239,9 @@ bool executeCommand(const char* cmd) {
 
     // --- File commands (flat, all files at /) ---
     if (strcmp(word, "l") == 0 || strcmp(word, "ls") == 0) {
-        int n = listDirectory("/");
+        int n = mountActive() ? listRemoteFiles() : listDirectory("/");
         if (n < 0) {
-            cmdSetResult("Can't read SD");
+            cmdSetResult(mountActive() ? "Can't list remote" : "Can't read SD");
         } else if (n == 0) {
             cmdSetResult("(empty)");
         } else {
@@ -2066,6 +2258,22 @@ bool executeCommand(const char* cmd) {
     } else if (strcmp(word, "e") == 0 || strcmp(word, "edit") == 0) {
         if (arg[0] == '\0') {
             cmdEditPickerStart();
+        } else if (mountActive()) {
+            cmdPickerStop();
+            autoSaveDirty();
+            if (loadRemoteFile(arg)) {
+                current_file = String("/") + String(arg);
+                cmdSetResult("Remote %s (%d B)", arg, text_len);
+                app_mode = MODE_NOTEPAD;
+            } else {
+                text_len = 0; cursor_pos = 0; scroll_line = 0;
+                text_buf[0] = '\0';
+                current_file = String("/") + String(arg);
+                file_is_remote = true;
+                file_modified = false;
+                cmdSetResult("New remote: %s", arg);
+                app_mode = MODE_NOTEPAD;
+            }
         } else {
             cmdPickerStop();
             autoSaveDirty();
@@ -2084,18 +2292,72 @@ bool executeCommand(const char* cmd) {
             }
         }
     } else if (strcmp(word, "w") == 0 || strcmp(word, "save") == 0) {
-        if (arg[0] != '\0') {
-            current_file = "/" + String(arg);
-        } else if (current_file.length() == 0) {
-            current_file = "/UNSAVED";
-        }
-        if (saveToFile(current_file.c_str())) {
-            cmdSetResult("Saved %s (%d B)", current_file.c_str(), text_len);
+        if (file_is_remote && mountActive()) {
+            const char* fname = arg[0] != '\0' ? arg : "";
+            if (fname[0] == '\0' && current_file.length() > 0) {
+                const char* s = current_file.c_str();
+                const char* sl = strrchr(s, '/');
+                fname = sl ? sl + 1 : s;
+            }
+            if (fname[0] == '\0') fname = "UNSAVED";
+            if (saveRemoteFile(fname)) {
+                current_file = String("/") + String(fname);
+                cmdSetResult("Saved remote %s (%d B)", fname, text_len);
+            } else {
+                cmdSetResult("Remote save failed");
+            }
         } else {
-            cmdSetResult("Save failed");
+            if (arg[0] != '\0') {
+                current_file = "/" + String(arg);
+            } else if (current_file.length() == 0) {
+                current_file = "/UNSAVED";
+            }
+            if (saveToFile(current_file.c_str())) {
+                cmdSetResult("Saved %s (%d B)", current_file.c_str(), text_len);
+            } else {
+                cmdSetResult("Save failed");
+            }
         }
     } else if (strcmp(word, "daily") == 0) {
         dailyOpenCommand();
+    } else if (strcmp(word, "mount") == 0) {
+        if (config_files_url[0] == '\0') {
+            cmdSetResult("No files URL in CONFIG");
+        } else if (arg[0] != '\0') {
+            // Direct mount by name
+            active_mount = arg;
+            file_is_remote = false;
+            cmdSetResult("Mount: %s", arg);
+        } else {
+            // Fetch mount list and show picker
+            if (!fetchMountList()) {
+                cmdSetResult("No mounts available");
+            } else {
+                cmd_picker_count = 0;
+                for (int i = 0; i < mount_list_count && i < MAX_FILE_LIST; i++) {
+                    cmd_picker_indices[cmd_picker_count++] = i;
+                }
+                cmdPickerStart(CMD_PICKER_MOUNT);
+            }
+        }
+    } else if (strcmp(word, "umount") == 0 || strcmp(word, "local") == 0) {
+        active_mount = "";
+        file_is_remote = false;
+        cmdSetResult("Local SD mode");
+    } else if (strcmp(word, "push") == 0) {
+        if (!mountActive()) {
+            cmdSetResult("No mount active");
+        } else {
+            char url[256];
+            mountPushUrl(url, sizeof(url));
+            String resp;
+            int code = httpPost(url, &resp);
+            if (code == 200) {
+                cmdSetResult("Pushed %s", active_mount.c_str());
+            } else {
+                cmdSetResult("Push failed (%d)", code);
+            }
+        }
     } else if (strcmp(word, "r") == 0 || strcmp(word, "rm") == 0) {
         if (arg[0] == '\0') { cmdSetResult("r <name>"); }
         else {
@@ -2298,10 +2560,12 @@ bool executeCommand(const char* cmd) {
                    timeSyncSourceName(time_sync_source));
         cmdAddLine("TZ:%s", timeSyncGetTimeZone());
         if (shortcut_running) cmdAddLine("Shortcut:running");
+        if (mountActive()) cmdAddLine("Mount:%s%s", active_mount.c_str(), file_is_remote ? "(r)" : "");
         if (current_file.length() > 0) cmdAddLine("File:%s%s", current_file.c_str(), file_modified ? "*" : "");
     } else if (strcmp(word, "h") == 0 || strcmp(word, "help") == 0) {
         cmdClearResult();
         cmdAddLine("l/ls e/edit w/save daily r/rm");
+        cmdAddLine("mount umount push");
         cmdAddLine("u/upload d/download p/paste ssh np dc");
         cmdAddLine("ws wfi bs bt gs/gpss gps mds mdm msh mss");
         cmdAddLine("mss tx <text> / !<node> <text>");

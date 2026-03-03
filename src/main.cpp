@@ -65,6 +65,9 @@ static bool   vpn_connected = false;
 static bool vpnConfigured() { return config_vpn_privkey[0] != '\0'; }
 static bool vpnActive() { return vpn_connected && wg.is_initialized(); }
 
+// --- Files Service Config (loaded from SD /CONFIG) ---
+static char config_files_url[128] = "";
+
 // Forward declarations
 void connectMsg(const char* fmt, ...);
 void powerOff();
@@ -174,6 +177,14 @@ static bool cmd_result_valid = false;
 // --- File State ---
 static String current_file = "";
 static bool file_modified = false;
+
+// --- Remote Mount State ---
+static String active_mount = "";         // empty = local SD mode
+static bool file_is_remote = false;      // true when current file loaded from mount
+#define MAX_MOUNT_LIST 8
+static char mount_list[MAX_MOUNT_LIST][32];
+static int mount_list_count = 0;
+static bool mountActive() { return active_mount.length() > 0 && config_files_url[0] != '\0'; }
 
 static SemaphoreHandle_t state_mutex;
 // Protects libssh channel I/O across cores (receive task vs input writers).
@@ -1100,7 +1111,7 @@ void sdLoadConfig() {
     // # bt   — optional BLE settings ([optional enable], name, [optional 6-digit pin])
     // # time — optional timezone (POSIX TZ string), e.g. PST8PDT,M3.2.0,M11.1.0
     // # msh  — optional channel config (line1=name, line2=key spec)
-    enum { SEC_WIFI, SEC_SSH, SEC_VPN, SEC_BT, SEC_TIME, SEC_MSH } section = SEC_WIFI;
+    enum { SEC_WIFI, SEC_SSH, SEC_VPN, SEC_BT, SEC_TIME, SEC_MSH, SEC_FILES } section = SEC_WIFI;
     int field = 0;  // field index within current section
     bool wifi_expect_ssid = true;
     char wifi_ssid[64] = "";
@@ -1153,6 +1164,9 @@ void sdLoadConfig() {
                 field = 0;
             } else if (line.indexOf("msh") >= 0 || line.indexOf("meshtastic") >= 0) {
                 section = SEC_MSH;
+                field = 0;
+            } else if (line.indexOf("files") >= 0) {
+                section = SEC_FILES;
                 field = 0;
             }
             continue;
@@ -1288,6 +1302,16 @@ void sdLoadConfig() {
                 config_msh_psk[sizeof(config_msh_psk) - 1] = '\0';
             }
             field++;
+        } else if (section == SEC_FILES) {
+            if (field == 0) {
+                strncpy(config_files_url, line.c_str(), sizeof(config_files_url) - 1);
+                config_files_url[sizeof(config_files_url) - 1] = '\0';
+                // Strip trailing slash
+                int len = strlen(config_files_url);
+                while (len > 0 && config_files_url[len - 1] == '/') config_files_url[--len] = '\0';
+                SERIAL_LOGF("SD: files URL: %s\n", config_files_url);
+            }
+            field++;
         }
     }
     flushPendingOpenWiFi();
@@ -1316,6 +1340,7 @@ enum CmdPickerMode {
     CMD_PICKER_NONE = 0,
     CMD_PICKER_EDIT,
     CMD_PICKER_WIFI,
+    CMD_PICKER_MOUNT,
 };
 
 struct WifiScanPickerEntry {
@@ -1341,6 +1366,12 @@ bool wifiPickerConnectSelectedNetwork(const char* ssid, bool open_network, bool 
 int listDirectory(const char* path);
 bool loadFromFile(const char* path);
 void autoSaveDirty();
+
+// Remote file operations (implemented in cli_module.hpp).
+static int listRemoteFiles();
+static bool loadRemoteFile(const char* name);
+static bool saveRemoteFile(const char* name);
+static bool fetchMountList();
 
 void cmdClearResult() {
     cmd_result_count = 0;
@@ -1459,12 +1490,14 @@ bool cmdPickerIsWifiActive() {
 const char* cmdPickerPromptWord() {
     if (cmd_picker_mode == CMD_PICKER_EDIT) return "edit";
     if (cmd_picker_mode == CMD_PICKER_WIFI) return "ws";
+    if (cmd_picker_mode == CMD_PICKER_MOUNT) return "mount";
     return "";
 }
 
 const char* cmdPickerStatusHint() {
     if (cmd_picker_mode == CMD_PICKER_WIFI) return "[PICK] WiFi W/S A/D Enter";
     if (cmd_picker_mode == CMD_PICKER_EDIT) return "[PICK] Edit W/S A/D Enter";
+    if (cmd_picker_mode == CMD_PICKER_MOUNT) return "[PICK] Mount W/S Enter";
     return "";
 }
 
@@ -1517,6 +1550,8 @@ void cmdPickerRender() {
         cmdAddLine("Edit %d/%d W/S A/D Enter", cmd_picker_selected + 1, cmd_picker_count);
     } else if (cmd_picker_mode == CMD_PICKER_WIFI) {
         cmdAddLine("WiFi %d/%d *known o=open", cmd_picker_selected + 1, cmd_picker_count);
+    } else if (cmd_picker_mode == CMD_PICKER_MOUNT) {
+        cmdAddLine("Mount %d/%d W/S Enter", cmd_picker_selected + 1, cmd_picker_count);
     } else {
         cmdSetResult("(picker unavailable)");
         return;
@@ -1543,6 +1578,11 @@ void cmdPickerRender() {
                        open_mark,
                        entry.ssid,
                        entry.rssi);
+        } else if (cmd_picker_mode == CMD_PICKER_MOUNT) {
+            if (ref_idx < 0 || ref_idx >= mount_list_count) continue;
+            cmdAddLine("%c %s",
+                       (list_idx == cmd_picker_selected) ? '>' : ' ',
+                       mount_list[ref_idx]);
         }
     }
 }
@@ -1581,15 +1621,28 @@ bool cmdEditPickerOpenSelectedInternal() {
     const FileEntry& entry = file_list[file_idx];
 
     autoSaveDirty();
-    String path = "/" + String(entry.name);
-    bool ok = loadFromFile(path.c_str());
-    cmdPickerStop();
-    if (ok) {
-        current_file = path;
-        cmdSetResult("Loaded %s (%d B)", entry.name, text_len);
-        app_mode = MODE_NOTEPAD;
+
+    if (mountActive()) {
+        bool ok = loadRemoteFile(entry.name);
+        cmdPickerStop();
+        if (ok) {
+            current_file = String("/") + String(entry.name);
+            cmdSetResult("Remote %s (%d B)", entry.name, text_len);
+            app_mode = MODE_NOTEPAD;
+        } else {
+            cmdSetResult("Remote load failed: %s", entry.name);
+        }
     } else {
-        cmdSetResult("Load failed: %s", entry.name);
+        String path = "/" + String(entry.name);
+        bool ok = loadFromFile(path.c_str());
+        cmdPickerStop();
+        if (ok) {
+            current_file = path;
+            cmdSetResult("Loaded %s (%d B)", entry.name, text_len);
+            app_mode = MODE_NOTEPAD;
+        } else {
+            cmdSetResult("Load failed: %s", entry.name);
+        }
     }
     return true;
 }
@@ -1612,10 +1665,13 @@ bool cmdWifiPickerOpenSelectedInternal() {
     return wifiPickerConnectSelectedNetwork(ssid, open_network, known_network);
 }
 
+bool cmdMountPickerOpenSelectedInternal();
+
 bool cmdPickerOpenSelected() {
     if (!cmdPickerIsActive()) return false;
     if (cmd_picker_mode == CMD_PICKER_EDIT) return cmdEditPickerOpenSelectedInternal();
     if (cmd_picker_mode == CMD_PICKER_WIFI) return cmdWifiPickerOpenSelectedInternal();
+    if (cmd_picker_mode == CMD_PICKER_MOUNT) return cmdMountPickerOpenSelectedInternal();
     return false;
 }
 
@@ -1624,6 +1680,7 @@ bool cmdPickerCancel() {
     CmdPickerMode mode = cmd_picker_mode;
     cmdPickerStop();
     if (mode == CMD_PICKER_WIFI) cmdSetResult("WiFi select cancelled");
+    else if (mode == CMD_PICKER_MOUNT) cmdSetResult("Mount cancelled");
     else cmdSetResult("Edit cancelled");
     return true;
 }
@@ -1633,10 +1690,10 @@ void cmdEditPickerStop() {
 }
 
 bool cmdEditPickerStart() {
-    int n = listDirectory("/");
+    int n = mountActive() ? listRemoteFiles() : listDirectory("/");
     if (n < 0) {
         cmdPickerStop();
-        cmdSetResult("Can't read SD");
+        cmdSetResult(mountActive() ? "Can't list remote" : "Can't read SD");
         return false;
     }
 
@@ -1777,6 +1834,14 @@ bool loadFromFile(const char* path) {
 
 void autoSaveDirty() {
     if (!file_modified || text_len == 0) return;
+    if (file_is_remote && mountActive()) {
+        const char* s = current_file.c_str();
+        const char* sl = strrchr(s, '/');
+        const char* fname = sl ? sl + 1 : s;
+        if (fname[0] == '\0') fname = "UNSAVED";
+        saveRemoteFile(fname);
+        return;
+    }
     if (current_file.length() == 0) current_file = "/UNSAVED";
     saveToFile(current_file.c_str());
 }

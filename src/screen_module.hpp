@@ -180,15 +180,25 @@ void drawStatusBar(const LayoutInfo& info) {
     char mods[16] = "";
     if (snap_shift) strcat(mods, "SH ");
     if (snap_sym)   strcat(mods, "SY ");
-    // Show filename if editing a file
+    // Show filename if editing a file, with mount prefix if remote
     const char* fname = "";
     if (current_file.length() > 0) {
         const char* s = current_file.c_str();
         const char* sl = strrchr(s, '/');
         fname = sl ? sl + 1 : s;
     }
-    snprintf(status, sizeof(status), "%s%s L%d C%d %s",
-             fname, file_modified ? "*" : "",
+    char file_prefix[48] = "";
+    if (mountActive() && active_mount.length() > 0 && fname[0] != '\0') {
+        snprintf(file_prefix, sizeof(file_prefix), "%s:%s", active_mount.c_str(), fname);
+    } else if (mountActive() && active_mount.length() > 0) {
+        snprintf(file_prefix, sizeof(file_prefix), "[%s]", active_mount.c_str());
+    } else if (fname[0] != '\0') {
+        strncpy(file_prefix, fname, sizeof(file_prefix) - 1);
+        file_prefix[sizeof(file_prefix) - 1] = '\0';
+    }
+    const char* remote_suffix = (file_is_remote && mountActive()) ? "(r)" : "";
+    snprintf(status, sizeof(status), "%s%s%s L%d C%d %s",
+             file_prefix, file_modified ? "*" : "", remote_suffix,
              info.cursor_line + 1, info.cursor_col + 1,
              mods);
     char right[48];
