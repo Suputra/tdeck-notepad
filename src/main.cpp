@@ -60,6 +60,11 @@ static char   config_vpn_dns[32]     = "";
 static char   config_time_tz[64]     = "UTC0";
 static char   config_msh_channel[32] = "";
 static char   config_msh_psk[96]     = "";
+
+// --- OTA Config (loaded from SD /CONFIG) ---
+static char   config_ota_host[32]    = "s-term";
+static char   config_ota_pass[64]    = "";
+
 static WireGuard wg;
 static bool   vpn_connected = false;
 static bool vpnConfigured() { return config_vpn_privkey[0] != '\0'; }
@@ -1100,7 +1105,8 @@ void sdLoadConfig() {
     // # bt   — optional BLE settings ([optional enable], name, [optional 6-digit pin])
     // # time — optional timezone (POSIX TZ string), e.g. PST8PDT,M3.2.0,M11.1.0
     // # msh  — optional channel config (line1=name, line2=key spec)
-    enum { SEC_WIFI, SEC_SSH, SEC_VPN, SEC_BT, SEC_TIME, SEC_MSH } section = SEC_WIFI;
+    // # ota  — optional network push OTA ([optional hostname], [optional password])
+    enum { SEC_WIFI, SEC_SSH, SEC_VPN, SEC_BT, SEC_TIME, SEC_MSH, SEC_OTA } section = SEC_WIFI;
     int field = 0;  // field index within current section
     bool wifi_expect_ssid = true;
     char wifi_ssid[64] = "";
@@ -1153,6 +1159,9 @@ void sdLoadConfig() {
                 field = 0;
             } else if (line.indexOf("msh") >= 0 || line.indexOf("meshtastic") >= 0) {
                 section = SEC_MSH;
+                field = 0;
+            } else if (line.indexOf("ota") >= 0) {
+                section = SEC_OTA;
                 field = 0;
             }
             continue;
@@ -1288,17 +1297,31 @@ void sdLoadConfig() {
                 config_msh_psk[sizeof(config_msh_psk) - 1] = '\0';
             }
             field++;
+        } else if (section == SEC_OTA) {
+            // line 1 (optional): mDNS hostname, line 2 (optional): push password
+            switch (field) {
+                case 0:
+                    strncpy(config_ota_host, line.c_str(), sizeof(config_ota_host) - 1);
+                    config_ota_host[sizeof(config_ota_host) - 1] = '\0';
+                    break;
+                case 1:
+                    strncpy(config_ota_pass, line.c_str(), sizeof(config_ota_pass) - 1);
+                    config_ota_pass[sizeof(config_ota_pass) - 1] = '\0';
+                    break;
+            }
+            field++;
         }
     }
     flushPendingOpenWiFi();
     f.close();
-    SERIAL_LOGF("SD: config loaded (%d WiFi APs, host=%s, VPN=%s, BT=runtime, BT name=%s, TZ=%s, MSH=%s)\n",
+    SERIAL_LOGF("SD: config loaded (%d WiFi APs, host=%s, VPN=%s, BT=runtime, BT name=%s, TZ=%s, MSH=%s, OTA=%s)\n",
                   config_wifi_count,
                   config_ssh_host,
                   vpnConfigured() ? "yes" : "no",
                   config_bt_name,
                   config_time_tz,
-                  config_msh_channel[0] ? config_msh_channel : "(default)");
+                  config_msh_channel[0] ? config_msh_channel : "(default)",
+                  config_ota_host);
 }
 
 // --- File I/O Helpers ---
@@ -1783,6 +1806,7 @@ void autoSaveDirty() {
 
 #include "time_sync_module.hpp"
 #include "network_module.hpp"
+#include "ota_module.hpp"
 #include "gnss_module.hpp"
 #include "modem_module.hpp"
 #include "meshtastic_module.hpp"
@@ -2099,6 +2123,7 @@ void setup() {
 // Core 1: keyboard polling — never blocks on display
 void loop() {
     agentPollSerial();
+    otaHandle();
     perfLoopTick();
     modemPoll();
     wifiScanPoll();

@@ -39,6 +39,8 @@ source scripts/setup-pio.sh
 ```bash
 pio run -t upload
 ```
+Uploads over USB by default, or over WiFi automatically once the device is on the
+network (see [Over-the-air updates](#over-the-air-updates)).
 
 (Optional serial output)
 
@@ -55,7 +57,7 @@ Type in notepad mode. Single-tap `MIC` to open command mode. Use `h` for command
 For debug automation and camera capture flow, see `Development` at the bottom.
 
 ## SD Card Configuration (`/CONFIG`)
-`/CONFIG` is section-based. Section lines start with `#` and include one of: `wifi`, `ssh`, `vpn`, `bt`, `time`, `msh`.
+`/CONFIG` is section-based. Section lines start with `#` and include one of: `wifi`, `ssh`, `vpn`, `bt`, `time`, `msh`, `ota`.
 
 Example:
 
@@ -94,6 +96,10 @@ PST8PDT,M3.2.0,M11.1.0
 # msh
 LongFast
 default
+
+# ota
+s-term
+ota_push_password
 ```
 
 Notes:
@@ -105,6 +111,7 @@ Notes:
 - Legacy `enable`/`disable` and passkey lines in `# bt` are ignored.
 - If `# time` is missing, timezone defaults to `UTC0`.
 - `# msh`: optional Meshtastic channel config (`line1=channel name`, `line2=key spec`). Key spec supports `default`, `none`, decimal index (`1` = default public key), `hex:<...>`, or `base64:<...>`.
+- `# ota`: optional network push OTA. Line 1 is the mDNS hostname (default `s-term` → `s-term.local`), line 2 is an optional push password. Both lines are optional; with no password, anyone on the LAN can reflash.
 
 ## Usage
 ### Notepad (default mode)
@@ -256,11 +263,29 @@ SPI bus is shared between e-ink and SD via cooperative `sd_busy` / `display_idle
 
 ## Development
 ### Build modes
-- Production: `pio run -t upload`
-- Debug automation: `pio run -e debug -t upload`
+- Production: `pio run -t upload` (OTA when reachable, else USB — see below)
+- Debug automation: `pio run -e debug -t upload` (USB only)
 
 `debug` maps to `T-Deck-Pro-debug` and enables `TDECK_AGENT_DEBUG=1` (serial automation protocol).
 Production keeps it disabled.
+
+### Over-the-air updates
+`pio run -t upload` picks the transport automatically — no flag or separate env.
+Before uploading it probes for the device on the LAN (mDNS host, default
+`s-term.local`, configurable via `# ota` in `/CONFIG`); if the device answers it
+uploads over WiFi, otherwise it falls back to USB serial. So the first flash (or any
+time the device is off the network) goes over USB, and later flashes go over the air
+whenever the device is awake and connected.
+
+The device must be awake and on WiFi to receive an OTA push; progress prints to
+serial, and it reboots into the new firmware automatically. The 16MB dual-app
+partition layout keeps the previous image in the other slot until the new one boots
+successfully.
+
+Host-side overrides (see `scripts/ota_or_usb.py`):
+- `STERM_OTA_HOST` — mDNS host to probe (default `s-term.local`).
+- `STERM_OTA_PASSWORD` — OTA push password, if one is set in `# ota`.
+- `STERM_FORCE_USB=1` — skip the probe and always use USB.
 
 ### Fast path (write + render + capture)
 ```bash
