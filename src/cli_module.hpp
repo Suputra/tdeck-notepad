@@ -43,7 +43,9 @@ static uint32_t gnss_scan_started_ms = 0;
 static uint32_t meshtastic_scan_started_ms = 0;
 static constexpr uint32_t GNSS_SCAN_DWELL_MS = 2000;
 static constexpr uint32_t MESHTASTIC_SCAN_DWELL_MS = 250;
+#if HAS_MODEM
 static constexpr uint32_t MODEM_SCAN_DWELL_MS = MODEM_SCAN_DEFAULT_DWELL_MS;
+#endif
 
 void finishWifiScanCommand() {
     int n = WiFi.scanComplete();
@@ -1351,6 +1353,14 @@ inline void poweroffDriveAndHold(int pin, bool level_high) {
 }
 
 inline void poweroffQuiesceHardware() {
+#if defined(BOARD_RETERMINAL)
+    // Deselect shared SPI devices and cut SD power for deep sleep.
+    poweroffDriveAndHold(BOARD_EPD_CS, HIGH);
+    poweroffDriveAndHold(BOARD_SD_CS, HIGH);
+    poweroffDriveAndHold(BOARD_SD_EN, LOW);
+    poweroffDriveAndHold(BOARD_BAT_EN, LOW);
+    gpio_deep_sleep_hold_en();
+#else
     // Turn off controllable module rails and indicator load switches.
     poweroffDriveAndHold(BOARD_LORA_EN, LOW);
     poweroffDriveAndHold(BOARD_GPS_EN, LOW);
@@ -1369,6 +1379,7 @@ inline void poweroffQuiesceHardware() {
 
     // Persist these GPIO levels through deep sleep.
     gpio_deep_sleep_hold_en();
+#endif
 }
 
 void powerOff() {
@@ -1428,10 +1439,18 @@ void powerOff() {
     display.hibernate();
 
     // Stop BLE advertising/connection before sleeping.
+#if HAS_BLE_HID
     btShutdown();
+#endif
+#if HAS_GNSS
     if (gnssIsPowered()) gnssSetPower(false);
+#endif
+#if HAS_MESHTASTIC
     if (meshtasticIsPowered()) meshtasticSetPowered(false);
+#endif
+#if HAS_MODEM
     if (modemIsPowered()) modemSetPowered(false);
+#endif
 
     // Stop shared buses before sleeping.
     if (sd_mounted) SD.end();
@@ -1445,7 +1464,11 @@ void powerOff() {
     // Drive externally switched rails fully off and keep them latched in sleep.
     poweroffQuiesceHardware();
 
-    // Enter deep sleep with no wakeup source (only reset wakes)
+#if defined(BOARD_RETERMINAL)
+    // Wake on a front-button press (active-low).
+    esp_sleep_enable_ext0_wakeup((gpio_num_t)BOARD_BTN_1, 0);
+#endif
+    // Enter deep sleep (T-Deck: only reset wakes; reTerminal: button wakes).
     esp_deep_sleep_start();
 }
 
@@ -1690,6 +1713,7 @@ void wifiScanCommand() {
     cmdSetResult("Scanning WiFi...");
 }
 
+#if HAS_GNSS
 void finishGnssScanCommand() {
     GnssSnapshot snap;
     gnssGetSnapshot(&snap);
@@ -1753,7 +1777,11 @@ void gnssScanCommand() {
     gnss_scan_started_ms = millis();
     cmdSetResult("Scanning GPS...");
 }
+#else
+void gnssScanPoll() {}
+#endif
 
+#if HAS_MESHTASTIC
 void finishMeshtasticScanCommand() {
     MeshtasticScanResult snap;
     if (!meshtasticScanStatus(&snap)) {
@@ -1878,7 +1906,11 @@ void meshtasticSendTextCommand(const char* text) {
         cmdSetResult("MSH tx failed: %s", meshtasticLastError()[0] ? meshtasticLastError() : "err");
     }
 }
+#else
+void meshtasticScanPoll() {}
+#endif
 
+#if HAS_MODEM
 void finishModemScanCommand() {
     ModemScanResult snap;
     if (!modemScanTakeResult(&snap)) return;
@@ -1937,7 +1969,12 @@ void modemScanCommand() {
     modem_scan_pending = true;
     cmdSetResult("Modem scan starting...");
 }
+#else
+void modemScanPoll() {}
+void modemPowerNotifyPoll() {}
+#endif
 
+#if HAS_BLE_HID
 void finishBtScanCommand() {
     BtScanEntry found[BT_SCAN_MAX_RESULTS];
     int shown = 0;
@@ -1987,6 +2024,9 @@ void btScanCommand() {
     bt_scan_pending = true;
     cmdSetResult("Scanning BT...");
 }
+#else
+void btScanPoll() {}
+#endif
 
 void dailyOpenCommand() {
     char name[20];
@@ -2137,12 +2177,17 @@ bool executeCommand(const char* cmd) {
     } else if (strcmp(word, "ws") == 0) {
         wifiScanCommand();
     } else if (strcmp(word, "mds") == 0) {
+#if HAS_MODEM
         if (arg[0] != '\0') {
             cmdSetResult("mds (no args)");
         } else {
             modemScanCommand();
         }
+#else
+        cmdSetResult("mds: n/a on this device");
+#endif
     } else if (strcmp(word, "mdm") == 0) {
+#if HAS_MODEM
         if (arg[0] != '\0') {
             cmdSetResult("mdm (toggle only)");
         } else if (modemScanInProgress()) {
@@ -2172,6 +2217,9 @@ bool executeCommand(const char* cmd) {
                 }
             }
         }
+#else
+        cmdSetResult("mdm: n/a on this device");
+#endif
     } else if (strcmp(word, "wfi") == 0) {
         if (arg[0] != '\0') {
             cmdSetResult("wfi (toggle only)");
@@ -2179,12 +2227,17 @@ bool executeCommand(const char* cmd) {
             wifiToggleCommand();
         }
     } else if (strcmp(word, "bs") == 0) {
+#if HAS_BLE_HID
         if (arg[0] != '\0') {
             cmdSetResult("bs (no args)");
         } else {
             btScanCommand();
         }
+#else
+        cmdSetResult("bs: n/a on this device");
+#endif
     } else if (strcmp(word, "bt") == 0) {
+#if HAS_BLE_HID
         if (arg[0] != '\0') {
             cmdSetResult("bt (toggle only)");
         } else {
@@ -2209,13 +2262,21 @@ bool executeCommand(const char* cmd) {
                 cmdSetResult("BT off");
             }
         }
+#else
+        cmdSetResult("BLE input: %s", btStatusShort());
+#endif
     } else if (strcmp(word, "gs") == 0 || strcmp(word, "gpss") == 0) {
+#if HAS_GNSS
         if (arg[0] != '\0') {
             cmdSetResult("gs/gpss (no args)");
         } else {
             gnssScanCommand();
         }
+#else
+        cmdSetResult("gs: n/a on this device");
+#endif
     } else if (strcmp(word, "gps") == 0) {
+#if HAS_GNSS
         if (arg[0] != '\0') {
             cmdSetResult("gps (toggle only)");
         } else {
@@ -2228,7 +2289,11 @@ bool executeCommand(const char* cmd) {
             else snprintf(sats, sizeof(sats), "-");
             cmdSetResult("GPS %s fix:%s sats:%s", next ? "on" : "off", snap.has_fix ? "yes" : "no", sats);
         }
+#else
+        cmdSetResult("gps: n/a on this device");
+#endif
     } else if (strcmp(word, "mss") == 0) {
+#if HAS_MESHTASTIC
         if (arg[0] == '\0') {
             meshtasticScanCommand();
         } else if (strncmp(arg, "tx ", 3) == 0 && arg[3] != '\0') {
@@ -2236,7 +2301,11 @@ bool executeCommand(const char* cmd) {
         } else {
             cmdSetResult("mss | mss tx <text> | mss tx !<node> <text>");
         }
+#else
+        cmdSetResult("mss: n/a on this device");
+#endif
     } else if (strcmp(word, "msh") == 0) {
+#if HAS_MESHTASTIC
         if (arg[0] != '\0') {
             cmdSetResult("msh (toggle only)");
         } else if (meshtastic_scan_pending) {
@@ -2252,6 +2321,9 @@ bool executeCommand(const char* cmd) {
                 else cmdSetResult("MSH off failed: %s", meshtasticLastError()[0] ? meshtasticLastError() : "err");
             }
         }
+#else
+        cmdSetResult("msh: n/a on this device");
+#endif
     } else if (strcmp(word, "date") == 0) {
         clockDateCommand();
     } else if (strcmp(word, "s") == 0 || strcmp(word, "status") == 0) {
@@ -2260,9 +2332,14 @@ bool executeCommand(const char* cmd) {
         else if (wifi_state == WIFI_CONNECTING) ws = "...";
         else if (wifi_state == WIFI_FAILED) ws = "fail";
         cmdClearResult();
+#if HAS_MODEM
         cmdAddLine("WiFi:%s 4G:%s SSH:%s BT:%s", ws, modemStatusShort(), ssh_connected ? "ok" : "off", btStatusShort());
+#else
+        cmdAddLine("WiFi:%s SSH:%s BT:%s", ws, ssh_connected ? "ok" : "off", btStatusShort());
+#endif
         cmdAddLine("BT name:%s", config_bt_name);
         cmdAddLine("BT pair:%s", btIsBonded() ? "bonded" : "unpaired");
+#if HAS_MESHTASTIC
         MeshtasticSnapshot msh;
         meshtasticGetSnapshot(&msh);
         char msh_pkt[12];
@@ -2274,6 +2351,8 @@ bool executeCommand(const char* cmd) {
         if (msh.last_error[0] != '\0') {
             cmdAddLine("MSH why:%s", msh.last_error);
         }
+#endif
+#if HAS_MODEM
         int csq = modemLastCsq();
         if (csq >= 0) {
             if (csq <= 31) cmdAddLine("4G CSQ:%d RSSI:%ddBm", csq, -113 + (2 * csq));
@@ -2282,6 +2361,7 @@ bool executeCommand(const char* cmd) {
         if (modemLastError()[0] != '\0') {
             cmdAddLine("4G err:%s", modemLastError());
         }
+#endif
         if (wifi_last_fail_ssid[0] != '\0') {
             cmdAddLine("WiFi fail:%s", wifi_last_fail_ssid);
             cmdAddLine("Why:%s", wifi_last_fail_reason);
@@ -2289,9 +2369,11 @@ bool executeCommand(const char* cmd) {
         if (btPeerAddress()[0] != '\0') {
             cmdAddLine("BT peer:%s", btPeerAddress());
         }
+#if HAS_GNSS
         GnssSnapshot gnss;
         gnssGetSnapshot(&gnss);
         cmdAddLine("GPS:%s", gnss.power_on ? "on" : "off");
+#endif
         cmdAddLine("Bat:%d%% Heap:%dK", battery_pct, ESP.getFreeHeap() / 1024);
         cmdAddLine("Clock:%s(%s)",
                    timeSyncClockLooksValid() ? "set" : "unset",
@@ -2303,8 +2385,12 @@ bool executeCommand(const char* cmd) {
         cmdClearResult();
         cmdAddLine("l/ls e/edit w/save daily r/rm");
         cmdAddLine("u/upload d/download p/paste ssh np dc");
+#if HAS_MODEM || HAS_GNSS || HAS_MESHTASTIC || HAS_BLE_HID
         cmdAddLine("ws wfi bs bt gs/gpss gps mds mdm msh mss");
         cmdAddLine("mss tx <text> / !<node> <text>");
+#else
+        cmdAddLine("ws wfi bt");
+#endif
         cmdAddLine("date s/status h/help");
         cmdAddLine("<name> runs /name.x shortcut");
     } else {
@@ -2319,6 +2405,40 @@ bool executeCommand(const char* cmd) {
         }
     }
     return recognized;
+}
+
+// --- Command-buffer primitives (shared by the matrix keyboard and BLE input feeder) ---
+
+// Append a printable char to the command buffer. Returns true if it changed.
+bool cmdInsertChar(char c) {
+    if (c < ' ' || c > '~') return false;
+    if (cmd_len >= CMD_BUF_LEN) return false;
+    cmd_buf[cmd_len++] = c;
+    cmd_buf[cmd_len] = '\0';
+    return true;
+}
+
+// Delete the last char in the command buffer. Returns true if it changed.
+bool cmdBackspace() {
+    if (cmd_len <= 0) return false;
+    cmd_len--;
+    cmd_buf[cmd_len] = '\0';
+    return true;
+}
+
+// Submit the current command buffer. Caller must hold state_mutex; this releases
+// it around executeCommand (which manages its own locking) and re-takes it.
+bool cmdSubmit() {
+    char command[CMD_BUF_LEN + 1];
+    strncpy(command, cmd_buf, sizeof(command) - 1);
+    command[sizeof(command) - 1] = '\0';
+    cmdHistoryAddLocked(command);
+    cmd_len = 0;
+    cmd_buf[0] = '\0';
+    xSemaphoreGive(state_mutex);
+    executeCommand(command);
+    xSemaphoreTake(state_mutex, portMAX_DELAY);
+    return true;
 }
 
 bool handleCommandKeyPress(int event_code) {
@@ -2378,33 +2498,14 @@ bool handleCommandKeyPress(int event_code) {
 
     if (c == 0) return false;
 
-    if (c == '\b') {
-        if (cmd_len > 0) {
-            cmd_len--;
-            cmd_buf[cmd_len] = '\0';
+    if (c == '\b') return cmdBackspace();
+    if (c == '\n') return cmdSubmit();
+
+    if (c >= ' ' && c <= '~') {
+        if (cmdInsertChar(c)) {
+            if (shift_held) shift_held = false;
             return true;
         }
-        return false;
-    }
-
-    if (c == '\n') {
-        char command[CMD_BUF_LEN + 1];
-        strncpy(command, cmd_buf, sizeof(command) - 1);
-        command[sizeof(command) - 1] = '\0';
-        cmdHistoryAddLocked(command);
-        cmd_len = 0;
-        cmd_buf[0] = '\0';
-        xSemaphoreGive(state_mutex);
-        executeCommand(command);
-        xSemaphoreTake(state_mutex, portMAX_DELAY);
-        return true;
-    }
-
-    if (c >= ' ' && c <= '~' && cmd_len < CMD_BUF_LEN) {
-        cmd_buf[cmd_len++] = c;
-        cmd_buf[cmd_len] = '\0';
-        if (shift_held) shift_held = false;
-        return true;
     }
 
     return false;

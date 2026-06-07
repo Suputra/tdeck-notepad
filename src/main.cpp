@@ -1,8 +1,11 @@
 #include <Arduino.h>
+#include "firmware/device.h"
 #include <SPI.h>
 #include <Wire.h>
 #include <GxEPD2_BW.h>
+#if HAS_MATRIX_KEYBOARD
 #include <Adafruit_TCA8418.h>
+#endif
 #include <WiFi.h>
 #include <libssh/libssh.h>
 #include <esp_task_wdt.h>
@@ -47,7 +50,7 @@ static char config_ssh_pass[64]   = "";
 
 // --- Bluetooth Config (loaded from SD /CONFIG) ---
 static bool     config_bt_enabled = false;
-static char     config_bt_name[32] = "TDeck-Pro";
+static char     config_bt_name[32] = DEFAULT_BT_NAME;
 
 // --- VPN Config (loaded from SD /CONFIG) ---
 static char   config_vpn_privkey[64] = "";
@@ -91,19 +94,28 @@ static volatile bool display_idle = true;  // false while display is doing SPI
 
 // --- Display ---
 
+#if DISPLAY_DRIVER_RETERMINAL
+GxEPD2_BW<GxEPD2_750_GDEY075T7, GxEPD2_750_GDEY075T7::HEIGHT> display(
+    GxEPD2_750_GDEY075T7(BOARD_EPD_CS, BOARD_EPD_DC, BOARD_EPD_RST, BOARD_EPD_BUSY)
+);
+#else
 GxEPD2_BW<GxEPD2_310_GDEQ031T10, GxEPD2_310_GDEQ031T10::HEIGHT> display(
     GxEPD2_310_GDEQ031T10(BOARD_EPD_CS, BOARD_EPD_DC, BOARD_EPD_RST, BOARD_EPD_BUSY)
 );
+#endif
 
 // --- Keyboard ---
 
+#if HAS_MATRIX_KEYBOARD
 Adafruit_TCA8418 keypad;
+#endif
 
 // --- Touch (CST226SE direct I2C) ---
 
 static bool touch_available = false;
 static uint8_t touch_i2c_addr = 0x1A;  // Will be auto-detected (0x1A or 0x5A)
 
+#if HAS_TOUCH
 // Touch scroll state machine
 enum TouchState { TOUCH_IDLE, TOUCH_ACTIVE };
 static TouchState touch_state = TOUCH_IDLE;
@@ -151,6 +163,7 @@ static int cst226ReadTouch(int16_t* x, int16_t* y) {
     }
     return touched ? 1 : 0;
 }
+#endif // HAS_TOUCH
 
 // --- App Mode ---
 
@@ -207,6 +220,7 @@ static int  snap_scroll    = 0;
 static bool snap_shift     = false;
 static bool snap_sym       = false;
 
+#if HAS_TOUCH
 enum TouchTapArrow {
     TOUCH_TAP_ARROW_NONE,
     TOUCH_TAP_ARROW_UP,
@@ -214,6 +228,7 @@ enum TouchTapArrow {
     TOUCH_TAP_ARROW_LEFT,
     TOUCH_TAP_ARROW_RIGHT,
 };
+#endif
 
 // --- Terminal State (shared, protected by state_mutex) ---
 
@@ -1807,10 +1822,20 @@ void autoSaveDirty() {
 #include "time_sync_module.hpp"
 #include "network_module.hpp"
 #include "ota_module.hpp"
+#if HAS_GNSS
 #include "gnss_module.hpp"
+#endif
+#if HAS_MODEM
 #include "modem_module.hpp"
+#endif
+#if HAS_MESHTASTIC
 #include "meshtastic_module.hpp"
+#endif
+#if HAS_BLE_HID
 #include "bluetooth_module.hpp"
+#elif HAS_BLE_INPUT
+#include "ble_input_module.hpp"
+#endif
 #include "screen_module.hpp"
 #include "keyboard_module.hpp"
 #include "cli_module.hpp"
@@ -1818,6 +1843,7 @@ void autoSaveDirty() {
 
 // --- Setup & Loop ---
 
+#if HAS_TOUCH
 static bool terminalMouseTrackingEnabled() {
     return term_mouse_tracking_mode_mask != 0;
 }
@@ -1945,6 +1971,60 @@ static void handleTouchArrowTapLocked(TouchTapArrow arrow) {
         }
     }
 }
+#endif // HAS_TOUCH
+
+#if HAS_HW_BUTTONS
+// reTerminal front buttons (active-low). Edge-detected with a short debounce.
+static void pollHardwareButtons() {
+    static const int pins[3] = { BOARD_BTN_REFRESH, BOARD_BTN_1, BOARD_BTN_2 };
+    static bool prev[3] = { true, true, true };
+    static unsigned long last_ms[3] = { 0, 0, 0 };
+    unsigned long now_ms = millis();
+
+    for (int i = 0; i < 3; i++) {
+        bool up = (digitalRead(pins[i]) != LOW);
+        if (prev[i] && !up && (now_ms - last_ms[i]) > 200) {
+            last_ms[i] = now_ms;
+            if (i == 0) {
+                // Refresh: force a clean full redraw (de-ghost).
+                partial_count = 100;
+                if (app_mode == MODE_TERMINAL) term_render_requested = true;
+                else render_requested = true;
+            } else if (i == 1) {
+                // Open / close the command palette.
+                if (xSemaphoreTake(state_mutex, pdMS_TO_TICKS(25)) == pdTRUE) {
+                    if (app_mode == MODE_COMMAND) {
+                        app_mode = cmd_return_mode;
+                    } else {
+                        cmd_return_mode = app_mode;
+                        cmd_len = 0;
+                        cmd_buf[0] = '\0';
+                        cmdHistoryResetBrowseLocked();
+                        cmd_result_valid = false;
+                        cmdPickerStop();
+                        app_mode = MODE_COMMAND;
+                    }
+                    xSemaphoreGive(state_mutex);
+                    render_requested = true;
+                }
+            } else {
+                // Toggle notepad <-> terminal.
+                if (xSemaphoreTake(state_mutex, pdMS_TO_TICKS(25)) == pdTRUE) {
+                    if (app_mode == MODE_TERMINAL) {
+                        app_mode = MODE_NOTEPAD;
+                        render_requested = true;
+                    } else {
+                        app_mode = MODE_TERMINAL;
+                        term_render_requested = true;
+                    }
+                    xSemaphoreGive(state_mutex);
+                }
+            }
+        }
+        prev[i] = up;
+    }
+}
+#endif // HAS_HW_BUTTONS
 
 void setup() {
     SERIAL_LOG_BEGIN(115200);
@@ -1955,6 +2035,12 @@ void setup() {
     timeSyncInit();
 
     // Clear any GPIO deep-sleep holds from a prior power-off cycle.
+#if defined(BOARD_RETERMINAL)
+    gpio_hold_dis((gpio_num_t)BOARD_EPD_CS);
+    gpio_hold_dis((gpio_num_t)BOARD_SD_CS);
+    gpio_hold_dis((gpio_num_t)BOARD_SD_EN);
+    gpio_hold_dis((gpio_num_t)BOARD_BAT_EN);
+#else
     gpio_hold_dis((gpio_num_t)BOARD_LORA_EN);
     gpio_hold_dis((gpio_num_t)BOARD_GPS_EN);
     gpio_hold_dis((gpio_num_t)BOARD_1V8_EN);
@@ -1968,6 +2054,7 @@ void setup() {
     gpio_hold_dis((gpio_num_t)BOARD_SD_CS);
     gpio_hold_dis((gpio_num_t)BOARD_EPD_CS);
     gpio_hold_dis((gpio_num_t)BOARD_TOUCH_RST);
+#endif
     gpio_deep_sleep_hold_dis();
 
     // BOOT is GPIO0 (active-low). Hold to trigger the same deep sleep path as "off".
@@ -1976,6 +2063,19 @@ void setup() {
     // Disable task watchdog — SSH blocking calls would trigger it
     esp_task_wdt_deinit();
 
+#if defined(BOARD_RETERMINAL)
+    // Front buttons, SD power, battery-sense enable, LED, shared-bus CS lines.
+    pinMode(BOARD_BTN_REFRESH, INPUT_PULLUP);
+    pinMode(BOARD_BTN_1, INPUT_PULLUP);
+    pinMode(BOARD_BTN_2, INPUT_PULLUP);
+    pinMode(BOARD_BAT_EN, OUTPUT); digitalWrite(BOARD_BAT_EN, LOW);
+    pinMode(BOARD_SD_EN, OUTPUT);  digitalWrite(BOARD_SD_EN, HIGH);
+    pinMode(BOARD_LED, OUTPUT);    digitalWrite(BOARD_LED, HIGH);  // active-low: off
+    pinMode(BOARD_EPD_CS, OUTPUT); digitalWrite(BOARD_EPD_CS, HIGH);
+    pinMode(BOARD_SD_CS, OUTPUT);  digitalWrite(BOARD_SD_CS, HIGH);
+    Wire.begin(BOARD_I2C_SDA, BOARD_I2C_SCL);
+    Wire.setClock(200000);
+#else
     // Disable unused peripherals
     pinMode(BOARD_LORA_EN, OUTPUT);        digitalWrite(BOARD_LORA_EN, LOW);
     pinMode(BOARD_GPS_EN, OUTPUT);         digitalWrite(BOARD_GPS_EN, LOW);
@@ -2069,14 +2169,20 @@ void setup() {
     } else {
         SERIAL_LOGLN("Touch not found at 0x1A");
     }
+#endif // board peripheral bring-up
 
     // Init SPI & e-paper
     SPI.begin(BOARD_SPI_SCK, BOARD_SPI_MISO, BOARD_SPI_MOSI);
     display.init(115200, true, 2, false);
     display.setRotation(0);
 
+#if DISPLAY_DRIVER_RETERMINAL
+    // 7.5" UC8179 panel — conservative SPI clock (tune up if stable).
+    display.epd2.selectSPI(SPI, SPISettings(10000000, MSBFIRST, SPI_MODE0));
+#else
     // Boost SPI clock from default 4MHz to 20MHz for faster data transfer
     display.epd2.selectSPI(SPI, SPISettings(20000000, MSBFIRST, SPI_MODE0));
+#endif
 
     memset(text_buf, 0, sizeof(text_buf));
 
@@ -2084,8 +2190,13 @@ void setup() {
     sdInit();
     sdLoadConfig();
     timeSyncSetTimeZone(config_time_tz);
+#if HAS_GNSS
     gnssInit();
+#endif
+#if HAS_MODEM
     modemInit();
+#endif
+#if HAS_MESHTASTIC
     meshtasticInit();
     if (config_msh_channel[0] != '\0' || config_msh_psk[0] != '\0') {
         if (!meshtasticConfigureChannel(config_msh_channel[0] ? config_msh_channel : NULL,
@@ -2095,7 +2206,12 @@ void setup() {
             SERIAL_LOGF("MSH: config applied (channel=%s)\n", config_msh_channel[0] ? config_msh_channel : "LongFast");
         }
     }
+#endif
+#if HAS_BLE_HID
     btInit();
+#elif HAS_BLE_INPUT
+    bleInputInit();
+#endif
     updateBattery();  // Seed battery_pct before the first status bar render.
 
     // Init terminal buffer
@@ -2125,15 +2241,24 @@ void loop() {
     agentPollSerial();
     otaHandle();
     perfLoopTick();
+#if HAS_BLE_INPUT
+    bleInputDrain();
+#endif
+#if HAS_MODEM
     modemPoll();
+#endif
     wifiScanPoll();
     btScanPoll();
     gnssScanPoll();
     meshtasticScanPoll();
+#if HAS_MESHTASTIC
     meshtasticPoll();
+#endif
     modemScanPoll();
     modemPowerNotifyPoll();
+#if HAS_GNSS
     gnssPoll();
+#endif
 
     // Press BOOT to request power-off (same behavior as the "off" command).
     if (!poweroff_requested) {
@@ -2199,6 +2324,7 @@ void loop() {
         }
     }
 
+#if HAS_TOUCH
     // --- Touch scroll polling ---
     if (touch_available && (millis() - last_touch_poll >= TOUCH_POLL_INTERVAL_MS)) {
         unsigned long now = millis();
@@ -2318,7 +2444,9 @@ void loop() {
             touch_did_scroll = false;
         }
     }
+#endif // HAS_TOUCH
 
+#if HAS_MATRIX_KEYBOARD
     while (keypad.available() > 0) {
         int ev = keypad.getEvent();
         if (!(ev & 0x80)) continue;  // skip release events
@@ -2351,4 +2479,9 @@ void loop() {
             }
         }
     }
+#endif // HAS_MATRIX_KEYBOARD
+
+#if HAS_HW_BUTTONS
+    pollHardwareButtons();
+#endif
 }

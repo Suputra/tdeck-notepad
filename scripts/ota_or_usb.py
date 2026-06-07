@@ -18,7 +18,11 @@ import sys
 
 Import("env")  # noqa: F821 — injected by PlatformIO
 
-OTA_HOST = os.environ.get("STERM_OTA_HOST", "s-term.local")
+# Default the OTA host per board so `pio run -e rt` can't accidentally flash a
+# T-Deck that is also on the LAN as s-term.local. Override with STERM_OTA_HOST.
+_pioenv = env["PIOENV"]  # noqa: F821
+_default_host = "reterm.local" if ("reterminal" in _pioenv or _pioenv in ("rt", "rtdebug")) else "s-term.local"
+OTA_HOST = os.environ.get("STERM_OTA_HOST", _default_host)
 OTA_PASSWORD = os.environ.get("STERM_OTA_PASSWORD", "")
 RESOLVE_TIMEOUT_S = 2.0
 

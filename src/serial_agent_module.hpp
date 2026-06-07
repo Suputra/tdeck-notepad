@@ -55,8 +55,10 @@ static bool agentDispatchEventLocked(int event_code) {
         needs_render = handleNotepadKeyPress(event_code);
     } else if (mode == MODE_TERMINAL) {
         needs_render = handleTerminalKeyPress(event_code);
+#if HAS_BLE_HID
     } else if (mode == MODE_BT) {
         needs_render = handleBluetoothKeyPress(event_code);
+#endif
     } else if (mode == MODE_COMMAND) {
         needs_render = handleCommandKeyPress(event_code);
     }
@@ -397,6 +399,7 @@ static void agentRunCommand(char* line) {
         return;
     }
 
+#if HAS_GNSS
     if (strcasecmp(p, "GPS") == 0) {
         GnssSnapshot snap;
         gnssGetSnapshot(&snap);
@@ -423,6 +426,7 @@ static void agentRunCommand(char* line) {
         xSemaphoreGive(state_mutex);
         return;
     }
+#endif
 
     if (strcasecmp(p, "STATE") == 0) {
         agentReportStateLocked();

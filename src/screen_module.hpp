@@ -90,6 +90,7 @@ void drawLinesRange(int first_line, int last_line) {
 static int battery_pct = -1;  // -1 = unknown
 
 void updateBattery() {
+#if HAS_FUEL_GAUGE
     Wire.beginTransmission(BQ27220_ADDR);
     Wire.write(BQ27220_REG_SOC);
     if (Wire.endTransmission(false) != 0) {
@@ -108,6 +109,18 @@ void updateBattery() {
         int soc = (hi << 8) | lo;
         if (soc >= 0 && soc <= 100) battery_pct = soc;
     }
+#else
+    // reTerminal: no fuel gauge — read the divider on ADC, gated by BAT_EN.
+    digitalWrite(BOARD_BAT_EN, HIGH);
+    delay(2);
+    uint32_t raw = analogReadMilliVolts(BOARD_BAT_ADC);
+    digitalWrite(BOARD_BAT_EN, LOW);
+    float voltage = (raw * 2.0f) / 1000.0f;   // 2x10k divider
+    int pct = (int)((voltage - 3.3f) / (4.2f - 3.3f) * 100.0f);
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    battery_pct = pct;
+#endif
 }
 
 // MIC tap timestamp (single tap opens command prompt after a short delay)
@@ -281,6 +294,7 @@ void drawTerminalStatusBar() {
         snprintf(status, sizeof(status), "WiFi %s%s", WiFi.localIP().toString().c_str(), bt_suffix);
     } else if (wifi_state == WIFI_CONNECTING) {
         snprintf(status, sizeof(status), "WiFi...%s", bt_suffix);
+#if HAS_MODEM
     } else if (modemGetState() == MODEM_STATE_SCANNING) {
         snprintf(status, sizeof(status), "4G scan...%s", bt_suffix);
     } else if (modemGetState() == MODEM_STATE_BOOTING) {
@@ -291,6 +305,7 @@ void drawTerminalStatusBar() {
         else snprintf(status, sizeof(status), "4G on%s", bt_suffix);
     } else if (modemGetState() == MODEM_STATE_ERROR) {
         snprintf(status, sizeof(status), "4G err%s", bt_suffix);
+#endif
     } else {
         snprintf(status, sizeof(status), btIsConnected() ? "BT %s" : "No net%s",
                  btIsConnected() ? btPeerAddress() : bt_suffix);

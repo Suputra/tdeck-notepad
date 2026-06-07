@@ -42,6 +42,32 @@ void cursorDown() {
     cursor_pos = text_len;
 }
 
+// --- Editor primitives (shared by the matrix keyboard and the BLE input feeder) ---
+
+// Insert a printable char or '\n' at the cursor. Returns true if the buffer changed.
+bool editorInsertChar(char c) {
+    if (c != '\n' && (c < ' ' || c > '~')) return false;
+    if (text_len >= MAX_TEXT_LEN) return false;
+    memmove(&text_buf[cursor_pos + 1], &text_buf[cursor_pos], text_len - cursor_pos);
+    text_buf[cursor_pos] = c;
+    text_len++;
+    cursor_pos++;
+    text_buf[text_len] = '\0';
+    file_modified = true;
+    return true;
+}
+
+// Delete the char before the cursor. Returns true if the buffer changed.
+bool editorBackspace() {
+    if (cursor_pos <= 0) return false;
+    memmove(&text_buf[cursor_pos - 1], &text_buf[cursor_pos], text_len - cursor_pos);
+    text_len--;
+    cursor_pos--;
+    text_buf[text_len] = '\0';
+    file_modified = true;
+    return true;
+}
+
 // --- Notepad Key Handler ---
 
 bool handleNotepadKeyPress(int event_code) {
@@ -82,26 +108,10 @@ bool handleNotepadKeyPress(int event_code) {
 
     if (c == 0) return false;
 
-    if (c == '\b') {
-        if (cursor_pos > 0) {
-            memmove(&text_buf[cursor_pos - 1], &text_buf[cursor_pos], text_len - cursor_pos);
-            text_len--;
-            cursor_pos--;
-            text_buf[text_len] = '\0';
-            file_modified = true;
-            return true;
-        }
-        return false;
-    }
+    if (c == '\b') return editorBackspace();
 
     if (c == '\n' || (c >= ' ' && c <= '~')) {
-        if (text_len < MAX_TEXT_LEN) {
-            memmove(&text_buf[cursor_pos + 1], &text_buf[cursor_pos], text_len - cursor_pos);
-            text_buf[cursor_pos] = c;
-            text_len++;
-            cursor_pos++;
-            text_buf[text_len] = '\0';
-            file_modified = true;
+        if (editorInsertChar(c)) {
             if (shift_held) shift_held = false;
             return true;
         }
@@ -178,7 +188,8 @@ bool handleTerminalKeyPress(int event_code) {
     return false;
 }
 
-// --- Bluetooth HID Key Handler ---
+// --- Bluetooth HID Key Handler (T-Deck: device acts as a BLE keyboard/mouse) ---
+#if HAS_BLE_HID
 
 bool handleBluetoothKeyPress(int event_code) {
     int key_num = (event_code & 0x7F);
@@ -230,3 +241,5 @@ bool handleBluetoothKeyPress(int event_code) {
     }
     return false;
 }
+
+#endif // HAS_BLE_HID

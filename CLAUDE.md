@@ -7,9 +7,17 @@ Use this flow for all on-device firmware verification.
 uv sync
 ```
 
+## Targets
+- T-Deck Pro (default): `pio run` / `pio run -e debug`.
+- reTerminal E1001: `pio run -e rt` / `pio run -e rtdebug` (aliases of `reterminal` / `reterminal-debug`). Same firmware,
+  selected by the `BOARD_RETERMINAL` capability flags in `src/firmware/device.h`. No physical
+  keyboard — input arrives over BLE from `scripts/companion.py`. Full guide: `docs/07-reterminal-companion.md`.
+  The serial automation protocol below works on `reterminal-debug` too (use `@TEXT`/`@RENDER`/`@CMD`/`@STATE`,
+  `@I2CSCAN` should show 0x51/0x44/0x6B). `@PRESS`/`@KEY` matrix tokens are T-Deck-only.
+
 ## Preferred Smoke Test
 ```bash
-pio run -e debug -t upload
+pio run -e debug                      # reTerminal: pio run -e rtdebug  (aliases upload by default)
 uv run scripts/agent_smoke.py --boot-wait 2
 ```
 

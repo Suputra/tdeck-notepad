@@ -1,5 +1,43 @@
 #pragma once
 
+#if defined(BOARD_RETERMINAL)
+
+// --- Seeed reTerminal E1001 (XIAO-ESP32-S3) ---
+// Pin map from Seeed Arduino cookbook + Zephyr board port (corroborated).
+// Display and microSD share one SPI bus (SCK/MOSI/MISO); they have separate CS.
+#define BOARD_I2C_SDA       19
+#define BOARD_I2C_SCL       20
+
+#define BOARD_SPI_SCK       7
+#define BOARD_SPI_MOSI      9
+#define BOARD_SPI_MISO      8
+
+#define BOARD_EPD_CS        10
+#define BOARD_EPD_DC        11
+#define BOARD_EPD_RST       12
+#define BOARD_EPD_BUSY      13
+
+#define BOARD_SD_CS         14
+#define BOARD_SD_DET        15   // card-detect (active low)
+#define BOARD_SD_EN         16   // drive HIGH to power the slot
+
+// Front buttons (active-low, internal pull-up). GPIO4 doubles as deep-sleep wake.
+#define BOARD_BTN_REFRESH   3
+#define BOARD_BTN_1         4
+#define BOARD_BTN_2         5
+
+// Battery: no fuel gauge — read divider on ADC, gated by an enable line.
+#define BOARD_BAT_ADC       1    // ADC1, x2.0 divider
+#define BOARD_BAT_EN        21   // drive HIGH to power the divider before reading
+
+#define BOARD_LED           6    // green, active-low
+#define BOARD_BUZZER        45   // passive piezo (PWM)
+
+#define BOARD_BOOT_PIN      0
+
+#else
+
+// --- LilyGo T-Deck Pro ---
 #define BOARD_I2C_SDA       13
 #define BOARD_I2C_SCL       14
 
@@ -40,3 +78,5 @@
 #define BOARD_TOUCH_RST     45
 
 #define BOARD_BOOT_PIN      0
+
+#endif

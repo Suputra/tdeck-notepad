@@ -2,6 +2,8 @@
 
 Firmware for the LilyGo T-Deck Pro: e-ink notepad, SSH terminal, SD-card file workflow, WireGuard support, and BLE/GPS/4G/Meshtastic-radio features. 
 
+The same firmware also targets the **Seeed reTerminal E1001** (7.5″ e-paper, ESP32-S3) as a laptop companion — a keyboard-less e-ink notepad / SSH terminal driven over BLE from your laptop. See [reTerminal E1001 companion build](docs/07-reterminal-companion.md).
+
 **IN DEVELOPMENT!** Many features may break or change!
 
 ## Overview
@@ -263,11 +265,19 @@ SPI bus is shared between e-ink and SD via cooperative `sd_busy` / `display_idle
 
 ## Development
 ### Build modes
-- Production: `pio run -t upload` (OTA when reachable, else USB — see below)
-- Debug automation: `pio run -e debug -t upload` (USB only)
+Short env aliases **build and upload** (no `-t upload` needed). Switch devices by switching the `-e` alias:
 
-`debug` maps to `T-Deck-Pro-debug` and enables `TDECK_AGENT_DEBUG=1` (serial automation protocol).
-Production keeps it disabled.
+| Command | Device | |
+|---------|--------|--|
+| `pio run -e td` | T-Deck Pro | production (OTA when reachable, else USB) |
+| `pio run -e debug` | T-Deck Pro | debug automation (USB only) |
+| `pio run -e rt` | reTerminal E1001 | production. See [docs/07](docs/07-reterminal-companion.md) |
+| `pio run -e rtdebug` | reTerminal E1001 | debug automation |
+
+The full env names (`T-Deck-Pro`, `reterminal`) build only (no upload) — use them to compile-check
+without a device. `debug`/`rtdebug` enable `TDECK_AGENT_DEBUG=1` (serial automation protocol).
+The reTerminal targets share the same firmware via the `BOARD_RETERMINAL` capability flags in
+`src/firmware/device.h`.
 
 ### Over-the-air updates
 `pio run -t upload` picks the transport automatically — no flag or separate env.

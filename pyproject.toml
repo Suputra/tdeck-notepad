@@ -6,6 +6,8 @@ requires-python = ">=3.10"
 dependencies = [
     "opencv-python>=4.10.0.84",
     "pyserial>=3.5",
+    "bleak>=0.22.0",
+    "pynput>=1.7.7",
 ]
 
 [tool.uv]
